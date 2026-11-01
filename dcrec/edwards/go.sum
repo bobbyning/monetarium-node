@@ -1,7 +1,7 @@
 github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412 h1:w1UutsfOrms1J05zt7ISrnJIXKzwaspym5BTKGx93EI=
 github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412/go.mod h1:WPjqKcmVOxf0XSf3YxCJs6N6AOSrOx3obionmG7T0y0=
-github.com/monetarium/monetarium-node/crypto/rand v1.3.13 h1:ZiNiObtviqfQe1PZB2qAC1Sl7fR30gTwCOulVp3jqTM=
-github.com/monetarium/monetarium-node/crypto/rand v1.3.13/go.mod h1:3fOYD2Kid37bBjUuVa0lZEIcHE8pFs7D2eNz4vdTo88=
+github.com/monetarium/monetarium-node/crypto/rand v1.3.14 h1:Tdjjc3fhiXTdJsnx1YMYAAVGvevPxlYdGPbib4w4R+4=
+github.com/monetarium/monetarium-node/crypto/rand v1.3.14/go.mod h1:3fOYD2Kid37bBjUuVa0lZEIcHE8pFs7D2eNz4vdTo88=
 golang.org/x/crypto v0.33.0 h1:IOBPskki6Lysi0lo9qQvbxiQ+FvsCC/YWOecCHAixus=
 golang.org/x/crypto v0.33.0/go.mod h1:bVdXmD7IV/4GdElGPozy6U7lWdRXA4qyRVGJV57uQ5M=
 golang.org/x/sys v0.30.0 h1:QjkSwP/36a20jFYWkSue1YwXzLmsV5Gfq7Eiy72C1uc=

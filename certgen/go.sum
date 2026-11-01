@@ -1,5 +1,5 @@
-github.com/monetarium/monetarium-node/crypto/rand v1.3.13 h1:ZiNiObtviqfQe1PZB2qAC1Sl7fR30gTwCOulVp3jqTM=
-github.com/monetarium/monetarium-node/crypto/rand v1.3.13/go.mod h1:3fOYD2Kid37bBjUuVa0lZEIcHE8pFs7D2eNz4vdTo88=
+github.com/monetarium/monetarium-node/crypto/rand v1.3.14 h1:Tdjjc3fhiXTdJsnx1YMYAAVGvevPxlYdGPbib4w4R+4=
+github.com/monetarium/monetarium-node/crypto/rand v1.3.14/go.mod h1:3fOYD2Kid37bBjUuVa0lZEIcHE8pFs7D2eNz4vdTo88=
 golang.org/x/crypto v0.33.0 h1:IOBPskki6Lysi0lo9qQvbxiQ+FvsCC/YWOecCHAixus=
 golang.org/x/crypto v0.33.0/go.mod h1:bVdXmD7IV/4GdElGPozy6U7lWdRXA4qyRVGJV57uQ5M=
 golang.org/x/net v0.28.0 h1:a9JDOJc5GMUJ0+UDqmLT86WiEy7iWyIhz8gz8E4e5hE=
