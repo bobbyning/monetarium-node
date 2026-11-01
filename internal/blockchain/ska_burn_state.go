@@ -163,6 +163,20 @@ func (s *SKABurnState) DisconnectSKABurnsTx(dbTx database.Tx, burns []SKABurnRec
 	return s.saveWithTx(dbTx)
 }
 
+// reload replaces the in-memory SKA burn state with the state stored in the
+// database.  The in-memory state is left unchanged when it cannot be loaded.
+func (s *SKABurnState) reload() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	burned := s.burned
+	s.burned = make(map[cointype.CoinType]*big.Int)
+	if err := s.load(); err != nil {
+		s.burned = burned
+		return err
+	}
+	return nil
+}
+
 // load reads the SKA burn state from the database.
 func (s *SKABurnState) load() error {
 	err := s.db.View(func(dbTx database.Tx) error {

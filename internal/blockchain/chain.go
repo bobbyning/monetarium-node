@@ -753,6 +753,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block, parent *dcrutil.Block,
 		return nil
 	})
 	if err != nil {
+		b.reloadSKAState()
 		return err
 	}
 
@@ -953,6 +954,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block, parent *dcrutil.Blo
 		return nil
 	})
 	if err != nil {
+		b.reloadSKAState()
 		return err
 	}
 
@@ -1010,6 +1012,22 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block, parent *dcrutil.Blo
 	b.chainLock.Lock()
 
 	return nil
+}
+
+// reloadSKAState restores the in-memory SKA emission and burn state from the
+// database after a failed database update, which may have changed the
+// in-memory state before the update was rolled back.
+func (b *BlockChain) reloadSKAState() {
+	if b.skaEmissionState != nil {
+		if err := b.skaEmissionState.reload(); err != nil {
+			log.Errorf("Failed to reload SKA emission state: %v", err)
+		}
+	}
+	if b.skaBurnState != nil {
+		if err := b.skaBurnState.reload(); err != nil {
+			log.Errorf("Failed to reload SKA burn state: %v", err)
+		}
+	}
 }
 
 // countSpentRegularOutputs returns the number of utxos the regular transactions

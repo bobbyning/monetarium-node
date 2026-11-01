@@ -110,6 +110,22 @@ func (s *SKAEmissionState) DisconnectSKAEmissionsTx(dbTx database.Tx, emissions 
 	return s.saveWithTx(dbTx)
 }
 
+// reload replaces the in-memory SKA emission state with the state stored in
+// the database.  The in-memory state is left unchanged when it cannot be
+// loaded.
+func (s *SKAEmissionState) reload() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	nonces, emitted := s.nonces, s.emitted
+	s.nonces = make(map[cointype.CoinType]uint64)
+	s.emitted = make(map[cointype.CoinType]bool)
+	if err := s.load(); err != nil {
+		s.nonces, s.emitted = nonces, emitted
+		return err
+	}
+	return nil
+}
+
 // load reads the SKA emission state from the database.
 func (s *SKAEmissionState) load() error {
 	err := s.db.View(func(dbTx database.Tx) error {
