@@ -1357,8 +1357,9 @@ func CheckSSFee(tx *wire.MsgTx) error {
 
 	// Input can be either null (creating new UTXO) or real (augmenting existing)
 	// Both are valid for SSFee transactions.
-	// Note: Real input validation (UTXO existence, coin type match) happens
-	// in validateSSFeeTxns() where the UTXO viewpoint is available.
+	// Note: Real input validation (UTXO existence, the type and script of the
+	// spent output) happens in CheckTransactionInputs() where the UTXO viewpoint
+	// is available.
 
 	// Check number of outputs
 	if len(tx.TxOut) < 1 || len(tx.TxOut) > MaxOutputsPerSSFee {

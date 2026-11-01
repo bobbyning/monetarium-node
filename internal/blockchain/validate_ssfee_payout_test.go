@@ -13,7 +13,7 @@ import (
 
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/blockchain/standalone"
-	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
@@ -206,31 +206,34 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 			votes, ssFeeTxns, fees := ssFeeTestLayout(t, test.coinType,
 				test.votes, test.fee, payScript)
 
-			// Make each SSFee add its fee to an earlier output, as the
-			// template generator does when it finds one.
+			// Make each SSFee add its fee to the output of a copy of it in
+			// the parent block, as the template generator does when it finds
+			// an output of an SSFee of the same type and script.
+			b, node := &BlockChain{}, (*blockNode)(nil)
 			if test.augmented {
+				b = newFakeChain(chaincfg.SimNetParams())
+				srcBlock := &wire.MsgBlock{Header: wire.BlockHeader{
+					PrevBlock: b.bestChain.Tip().hash, Height: 1}}
 				for i, tx := range ssFeeTxns {
-					prev := big.NewInt(int64(1_000 + i))
-					txIn := tx.TxIn[0]
-					txIn.PreviousOutPoint = wire.OutPoint{
-						Hash:  chainhash.Hash{byte(i + 1)},
-						Index: 1,
-						Tree:  wire.TxTreeStake,
-					}
-					txIn.BlockHeight = 100
-					payOut := tx.TxOut[1]
+					src := tx.Copy()
+					srcBlock.AddSTransaction(src)
+					tx.TxIn[0] = augmentingSSFeeTxIn(src, 1, uint32(i))
+					payOut, prev := tx.TxOut[1], src.TxOut[1]
 					if test.coinType.IsSKA() {
-						txIn.SKAValueIn = prev
-						payOut.SKAValue = new(big.Int).Add(payOut.SKAValue, prev)
+						payOut.SKAValue = new(big.Int).Add(payOut.SKAValue,
+							prev.SKAValue)
 					} else {
-						txIn.ValueIn = prev.Int64()
-						payOut.Value += prev.Int64()
+						payOut.Value += prev.Value
 					}
 				}
+				srcNode := newBlockNode(&srcBlock.Header, b.bestChain.Tip())
+				b.recentBlocks.Put(srcNode.hash, dcrutil.NewBlock(srcBlock))
+				header := wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2}
+				node = newBlockNode(&header, srcNode)
 			}
 
-			err := (&BlockChain{}).validateSSFeeTxns(nil, nil, votes,
-				ssFeeTxns, fees, standalone.SSVMonetarium)
+			err := b.validateSSFeeTxns(nil, node, votes, ssFeeTxns, fees,
+				standalone.SSVMonetarium)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

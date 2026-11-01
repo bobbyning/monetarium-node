@@ -435,34 +435,35 @@ func TestSameBlockStakeSpend(t *testing.T) {
 	}))
 	g.RejectTipBlock(ErrMissingTxOut)
 
-	// Ensure an augmented SSFee spending the same output is rejected as well.
+	// Ensure an augmented SSFee spending the payout of an SSFee earlier in the
+	// same block is rejected as well.  An augmented SSFee may only spend an
+	// SSFee output, so that is the only same-block output it could spend.
 	//
 	//   ... -> bsvh
 	//             \-> bss1
 	g.SetTip(baseName)
-	g.NextBlock("bss1", nil, outs[1:], sameBlockSpend(func(b *wire.MsgBlock,
-		originTx *wire.MsgTx, originIdx uint32) {
-
-		for _, stx := range b.STransactions {
+	g.NextBlock("bss1", nil, outs[1:], func(b *wire.MsgBlock) {
+		for i, stx := range b.STransactions {
 			if stake.DetermineTxType(stx) != stake.TxTypeSSFee {
 				continue
 			}
-			const paymentIdx = 1
-			amount := originTx.TxOut[0].Value
+			const paymentIdx = 0
+			amount := stx.TxOut[paymentIdx].Value
 			augmented := stx.Copy()
 			augmented.TxIn[0] = &wire.TxIn{
-				PreviousOutPoint: wire.OutPoint{Hash: originTx.TxHash()},
-				Sequence:         wire.MaxTxInSequenceNum,
-				ValueIn:          amount,
-				BlockHeight:      b.Header.Height,
-				BlockIndex:       originIdx,
+				PreviousOutPoint: wire.OutPoint{Hash: stx.TxHash(),
+					Index: paymentIdx, Tree: wire.TxTreeStake},
+				Sequence:    wire.MaxTxInSequenceNum,
+				ValueIn:     amount,
+				BlockHeight: b.Header.Height,
+				BlockIndex:  uint32(i),
 			}
 			augmented.TxOut[paymentIdx].Value += amount
 			b.AddSTransaction(augmented)
 			return
 		}
 		t.Fatal("block template has no SSFee transaction to augment")
-	}))
+	})
 	g.RejectTipBlock(ErrMissingTxOut)
 
 	// Ensure regular transactions are still allowed to spend outputs of an

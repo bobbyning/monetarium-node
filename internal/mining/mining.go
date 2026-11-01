@@ -6,6 +6,7 @@
 package mining
 
 import (
+	"bytes"
 	"container/heap"
 	"encoding/binary"
 	"encoding/hex"
@@ -80,6 +81,10 @@ type Config struct {
 	// it.  This function should return blocks regardless of whether or not they
 	// are part of the main chain.
 	BlockByHash func(hash *chainhash.Hash) (*dcrutil.Block, error)
+
+	// BlockByHeight defines the function to use to fetch the block at the
+	// given height in the main chain.
+	BlockByHeight func(height int64) (*dcrutil.Block, error)
 
 	// CalcNextRequiredDifficulty defines the function to use to calculate the
 	// required difficulty for the block after the given block based on the
@@ -895,12 +900,20 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 						isSpent = false
 					}
 				} else {
-					// No way to verify - assume available (legacy behavior)
-					isSpent = false
+					// No way to verify - treat the UTXO as unavailable
+					isSpent = true
 				}
 
 				if isSpent {
 					log.Debugf("SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
+				} else if entry.ScriptVersion() != 0 ||
+					!bytes.Equal(entry.PkScript(), recipientPkScript) {
+
+					// Consensus only lets an augmented SSFee pay back to the
+					// script of the output it spends.
+					log.Debugf("SSFee UTXO %v pays to a different script - creating new UTXO instead", outpoint)
+				} else if !generator.isSSFeeOutputOfType(outpoint, blockHeight, blockIndex, "SF") {
+					log.Debugf("SSFee UTXO %v is not a staker SSFee output - creating new UTXO instead", outpoint)
 				} else {
 					// UTXO is available - use for augmentation
 					existingOutpoint = outpoint
@@ -1107,12 +1120,20 @@ func createMinerSSFeeTx(coinType cointype.CoinType, totalFee *big.Int,
 					isSpent = false
 				}
 			} else {
-				// No way to verify - assume available (legacy behavior)
-				isSpent = false
+				// No way to verify - treat the UTXO as unavailable
+				isSpent = true
 			}
 
 			if isSpent {
 				log.Debugf("Miner SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
+			} else if entry.ScriptVersion() != scriptVersion ||
+				!bytes.Equal(entry.PkScript(), payScript) {
+
+				// Consensus only lets an augmented SSFee pay back to the
+				// script of the output it spends.
+				log.Debugf("Miner SSFee UTXO %v pays to a different script - creating new UTXO instead", outpoint)
+			} else if !generator.isSSFeeOutputOfType(outpoint, blockHeight, blockIndex, "MF") {
+				log.Debugf("Miner SSFee UTXO %v is not a miner SSFee output - creating new UTXO instead", outpoint)
 			} else {
 				// UTXO is available - safe to use for augmentation
 				inputOutpoint = outpoint
@@ -1141,7 +1162,7 @@ func createMinerSSFeeTx(coinType cointype.CoinType, totalFee *big.Int,
 			Sequence:         wire.MaxTxInSequenceNum,
 			BlockHeight:      uint32(existingBlockHeight),
 			BlockIndex:       existingBlockIndex,
-			SignatureScript:  []byte{}, // Anyone-can-spend (OP_SSGEN output)
+			SignatureScript:  []byte{}, // SSFee inputs carry no signature script
 		}
 		// SKA uses SKAValueIn (bigint), VAR uses ValueIn (int64)
 		if coinType.IsSKA() {
@@ -1649,6 +1670,32 @@ func (g *BlkTmplGenerator) ClearInFlightSSFeeUTXOs(blockHeight int64) {
 		}
 	}
 	g.inFlightMtx.Unlock()
+}
+
+// isSSFeeOutputOfType returns whether the output was created by an SSFee
+// transaction of the given type (SF or MF), located in the main chain at the
+// given height and stake tree index.  Consensus only lets an SSFee augment an
+// output of an SSFee of its own type, and the SSFee index can file an output
+// under the other type, so the type is read from the transaction itself.  It
+// returns false when the type cannot be confirmed.
+func (g *BlkTmplGenerator) isSSFeeOutputOfType(outpoint *wire.OutPoint,
+	height int64, index uint32, feeType string) bool {
+
+	if g == nil || g.cfg.BlockByHeight == nil {
+		return false
+	}
+	block, err := g.cfg.BlockByHeight(height)
+	if err != nil {
+		log.Debugf("Failed to fetch block at height %d for SSFee UTXO %v: %v",
+			height, outpoint, err)
+		return false
+	}
+	stxns := block.STransactions()
+	if int(index) >= len(stxns) || *stxns[index].Hash() != outpoint.Hash {
+		return false
+	}
+	srcFeeType, err := blockchain.SSFeeType(stxns[index].MsgTx())
+	return err == nil && srcFeeType == feeType
 }
 
 // isSSFeeUTXOInFlight returns true if the UTXO is already being used in a pending

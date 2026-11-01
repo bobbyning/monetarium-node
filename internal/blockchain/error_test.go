@@ -104,6 +104,8 @@ func TestErrorKindStringer(t *testing.T) {
 		{ErrForceReorgMissingChild, "ErrForceReorgMissingChild"},
 		{ErrBadStakebaseValue, "ErrBadStakebaseValue"},
 		{ErrStakeFees, "ErrStakeFees"},
+		{ErrBadSSFeeInput, "ErrBadSSFeeInput"},
+		{ErrSSFeeExpiry, "ErrSSFeeExpiry"},
 		{ErrNoStakeTx, "ErrNoStakeTx"},
 		{ErrBadBlockHeight, "ErrBadBlockHeight"},
 		{ErrBlockOneTx, "ErrBlockOneTx"},

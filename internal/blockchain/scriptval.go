@@ -255,9 +255,11 @@ func checkBlockScripts(block *dcrutil.Block, utxoView *UtxoViewpoint, txTree boo
 		}
 
 		// Skip ALL SSFee transactions - both null-input and augmented.
-		// SSFee outputs are anyone-can-spend (see validate.go:505) and require
-		// empty signature scripts. All security validations happen in validateSSFeeTxns():
+		// SSFee inputs require empty signature scripts (see checkTransactionContext).
+		// All security validations happen in validateSSFeeTxns():
 		// - UTXO existence and fraud proofs (CheckTransactionInputs)
+		// - The input spends an SSFee output and every non-OP_RETURN output
+		//   pays to its script (CheckTransactionInputs)
 		// - Maturity requirements (with augmented SSFee exemption)
 		// - Fee calculation: output = input + collected fees
 		// - No inflation: total fees match expected distribution

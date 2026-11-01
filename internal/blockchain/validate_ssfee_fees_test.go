@@ -108,7 +108,8 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 		addSSFees(b, excess)
 	})
 	_, err = g.chain.ProcessBlock(dcrutil.NewBlock(g.Tip()))
-	const wantMsg = "miner SSFee (null input) for coin type 1 distributes"
+	// The excess is not a fee, so the block has no SKA1 miner fee at all.
+	const wantMsg = "miner SSFee for coin type 1 in a block without miner fees in it"
 	if !errors.Is(err, ErrStakeFees) ||
 		!strings.Contains(err.Error(), wantMsg) {
 
@@ -234,6 +235,88 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	g.SetTip("bska5")
 	g.NextBlock("bska4", nil, nil, g.ReplaceWithNVotes(votes), spendChange(fee))
 	g.AcceptTipBlock()
+
+	// Make spendChange spend the change of bska4.
+	tip = g.Tip()
+	change = tip.Transactions[len(tip.Transactions)-1]
+	changeOut = wire.OutPoint{Hash: change.TxHash(), Index: 0}
+
+	// augment returns a munger that makes the SSFee transaction at position
+	// dst from the end of the stake tree add the payout of the SSFee
+	// transaction at position src from the end of the stake tree of bska4 to
+	// its own payout, paying to the script of that payout.
+	const staker, miner = 2, 1
+	augment := func(src, dst int) func(*wire.MsgBlock) {
+		srcIndex := len(tip.STransactions) - src
+		prev := tip.STransactions[srcIndex]
+		prevPayout := prev.TxOut[1]
+		return func(b *wire.MsgBlock) {
+			tx := b.STransactions[len(b.STransactions)-dst]
+			tx.TxIn[0] = &wire.TxIn{
+				PreviousOutPoint: wire.OutPoint{Hash: prev.TxHash(), Index: 1,
+					Tree: wire.TxTreeStake},
+				Sequence:    wire.MaxTxInSequenceNum,
+				SKAValueIn:  prevPayout.SKAValue,
+				BlockHeight: tip.Header.Height,
+				BlockIndex:  uint32(srcIndex),
+			}
+			payout := tx.TxOut[1]
+			payout.SKAValue = new(big.Int).Add(payout.SKAValue,
+				prevPayout.SKAValue)
+			payout.PkScript = prevPayout.PkScript
+		}
+	}
+
+	// Create a block whose miner SSFee adds its payout to the staker payout
+	// of bska4.
+	//
+	//   ... -> bska4 -> bminerstaker
+	g.NextBlock("bminerstaker", nil, nil, spendChange(fee),
+		augment(staker, miner))
+	g.RejectTipBlock(ErrBadSSFeeInput)
+
+	// Create a block whose staker and miner SSFee transactions add their
+	// payouts to those of bska4.
+	//
+	//   ... -> bska4 -> baugment
+	g.SetTip("bska4")
+	g.NextBlock("baugment", nil, nil, spendChange(fee),
+		augment(staker, staker), augment(miner, miner))
+	g.AcceptTipBlock()
+
+	// Reorganize to a sibling of baugment with fewer votes that augments the
+	// same payouts.  Disconnecting baugment restores the payouts of bska4 from
+	// its spend journal, and the sibling, which was never validated, connects
+	// only if they still read as SSFee outputs.  Then reorganize back.
+	//
+	//   ... -> bska4 -> baugment
+	//              \-> baugment2
+	g.SetTip("bska4")
+	g.NextBlock("baugment2", nil, nil, g.ReplaceWithNVotes(votes),
+		spendChange(fee), augment(staker, staker), augment(miner, miner))
+	g.AcceptedToSideChainWithExpectedTip("baugment")
+	g.ForceTipReorg("baugment", "baugment2")
+	g.ExpectTip("baugment2")
+	g.ForceTipReorg("baugment2", "baugment")
+	g.ExpectTip("baugment")
+
+	// Create a block without SKA1 fees whose miner SSFee adds nothing to the
+	// miner payout of baugment.
+	//
+	//   ... -> baugment -> bfreeminer
+	g.SetTip("baugment")
+	tip = g.Tip()
+	g.NextBlock("bfreeminer", nil, nil, func(b *wire.MsgBlock) {
+		b.AddSTransaction(skaSSFeeTx(stake.CreateMinerSSFeeMarker(
+			int64(b.Header.Height)), minerScript, new(big.Int)))
+	}, augment(miner, miner))
+	_, err = g.chain.ProcessBlock(dcrutil.NewBlock(g.Tip()))
+	if !errors.Is(err, ErrStakeFees) ||
+		!strings.Contains(err.Error(), wantMsg) {
+
+		t.Fatalf("block bfreeminer: got error %v, want %v containing %q",
+			err, ErrStakeFees, wantMsg)
+	}
 }
 
 // TestSSFeeRequiredForFees ensures a block without SSFee transactions is
