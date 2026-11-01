@@ -12,22 +12,58 @@ import (
 	"github.com/monetarium/monetarium-node/wire"
 )
 
-// TestExtractSSFeeConsolidationAddr tests extraction of consolidation address
-// from vote transactions in various scenarios.
-func TestExtractSSFeeConsolidationAddr(t *testing.T) {
+// TestExtractSSFeeConsolidationScript tests extraction of the consolidation
+// script from vote transactions in various scenarios.
+func TestExtractSSFeeConsolidationScript(t *testing.T) {
 	// Sample hash160 for testing
 	testHash160 := []byte{
 		0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x7a, 0x8b, 0x9c, 0x0d,
 		0x1e, 0x2f, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x9a, 0x0b,
 	}
+	// OP_SSGEN OP_DUP OP_HASH160 OP_DATA_20 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+	wantP2PKH := append(append([]byte{0xbb, 0x76, 0xa9, 0x14}, testHash160...), 0x88, 0xac)
+	// OP_SSGEN OP_HASH160 OP_DATA_20 <hash160> OP_EQUAL
+	wantP2SH := append(append([]byte{0xbb, 0xa9, 0x14}, testHash160...), 0x87)
 
 	tests := []struct {
-		name      string
-		buildTx   func() *wire.MsgTx
-		wantHash  []byte
-		wantErr   bool
-		errSubstr string
+		name       string
+		buildTx    func() *wire.MsgTx
+		wantScript []byte
+		wantErr    bool
+		errSubstr  string
 	}{
+		{
+			name: "P2SH consolidation (SH marker)",
+			buildTx: func() *wire.MsgTx {
+				script := buildConsolidationScript(testHash160)
+				script[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)}, // [0] block reference
+						{PkScript: make([]byte, 4)},  // [1] vote bits
+						{PkScript: script},           // [2] consolidation address
+					},
+				}
+			},
+			wantScript: wantP2SH,
+		},
+		{
+			name: "SH before SC: the first consolidation output wins",
+			buildTx: func() *wire.MsgTx {
+				sh := buildConsolidationScript(testHash160)
+				sh[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)}, // [0] block reference
+						{PkScript: make([]byte, 4)},  // [1] vote bits
+						{PkScript: sh},               // [2] P2SH consolidation
+						// [3] P2PKH consolidation of another hash160
+						{PkScript: buildConsolidationScript(make([]byte, 20))},
+					},
+				}
+			},
+			wantScript: wantP2SH,
+		},
 		{
 			name: "valid vote with consolidation at position 2",
 			buildTx: func() *wire.MsgTx {
@@ -41,8 +77,8 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 				}
 				return tx
 			},
-			wantHash: testHash160,
-			wantErr:  false,
+			wantScript: wantP2PKH,
+			wantErr:    false,
 		},
 		{
 			name: "valid vote with consolidation at position 3 (after 1 reward)",
@@ -58,8 +94,8 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 				}
 				return tx
 			},
-			wantHash: testHash160,
-			wantErr:  false,
+			wantScript: wantP2PKH,
+			wantErr:    false,
 		},
 		{
 			name: "valid vote with consolidation and treasury vote",
@@ -77,8 +113,8 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 				}
 				return tx
 			},
-			wantHash: testHash160,
-			wantErr:  false,
+			wantScript: wantP2PKH,
+			wantErr:    false,
 		},
 		{
 			name: "valid vote with multiple rewards before consolidation",
@@ -96,8 +132,8 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 				}
 				return tx
 			},
-			wantHash: testHash160,
-			wantErr:  false,
+			wantScript: wantP2PKH,
+			wantErr:    false,
 		},
 		{
 			name: "missing consolidation output",
@@ -163,6 +199,104 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 			errSubstr: "missing consolidation address",
 		},
 		{
+			name: "SH with wrong push opcode",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[1] = 0x15 // OP_DATA_21 instead of OP_DATA_22
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH without OP_RETURN",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[0] = 0x00 // OP_0 instead of OP_RETURN
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with invalid length (too short)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)[:23]
+				invalidScript[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with invalid length (too long)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := append(buildConsolidationScript(testHash160), 0x00)
+				invalidScript[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "invalid length (too long)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := append(buildConsolidationScript(testHash160), 0x00)
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with wrong first marker byte",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[2] = 0x99
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
 			name: "invalid length (too short)",
 			buildTx: func() *wire.MsgTx {
 				invalidScript := buildConsolidationScript(testHash160)[:23]
@@ -183,7 +317,7 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tx := tt.buildTx()
-			hash160, err := ExtractSSFeeConsolidationAddr(tx)
+			script, err := ExtractSSFeeConsolidationScript(tx)
 
 			if tt.wantErr {
 				if err == nil {
@@ -199,15 +333,25 @@ func TestExtractSSFeeConsolidationAddr(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if !bytes.Equal(hash160, tt.wantHash) {
-				t.Fatalf("hash160 mismatch\nwant: %x\ngot:  %x", tt.wantHash, hash160)
-			}
-
-			// Verify hash160 length
-			if len(hash160) != 20 {
-				t.Fatalf("invalid hash160 length: got %d, want 20", len(hash160))
+			if !bytes.Equal(script, tt.wantScript) {
+				t.Fatalf("script mismatch\nwant: %x\ngot:  %x", tt.wantScript, script)
 			}
 		})
+	}
+}
+
+// TestScriptHashConsolidationInvalidHash160 ensures the P2SH helpers reject a
+// hash160 of the wrong length, as their P2PKH counterparts do.
+func TestScriptHashConsolidationInvalidHash160(t *testing.T) {
+	for _, hash160 := range [][]byte{nil, make([]byte, 19), make([]byte, 21)} {
+		if _, err := CreateSSFeeScriptHashConsolidationOutput(hash160); err == nil {
+			t.Errorf("CreateSSFeeScriptHashConsolidationOutput accepted a %d-byte hash160",
+				len(hash160))
+		}
+		if _, err := ConsolidationScriptHashToPkScript(hash160); err == nil {
+			t.Errorf("ConsolidationScriptHashToPkScript accepted a %d-byte hash160",
+				len(hash160))
+		}
 	}
 }
 
@@ -408,38 +552,61 @@ func TestConsolidationAddrToPkScript(t *testing.T) {
 	}
 }
 
-// TestConsolidationRoundtrip tests that Create + Extract produces the original hash160.
+// TestConsolidationRoundtrip tests that Create + Extract produces the payment
+// script of the original hash160 and address type, and that
+// ExtractSSFeeConsolidationAddr returns that hash160 for either type.
 func TestConsolidationRoundtrip(t *testing.T) {
 	testHash160 := []byte{
 		0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x7a, 0x8b, 0x9c, 0x0d,
 		0x1e, 0x2f, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x9a, 0x0b,
 	}
 
-	// Create output
-	output, err := CreateSSFeeConsolidationOutput(testHash160)
-	if err != nil {
-		t.Fatalf("CreateSSFeeConsolidationOutput failed: %v", err)
+	tests := []struct {
+		name         string
+		createOutput func([]byte) (*wire.TxOut, error)
+		toPkScript   func([]byte) ([]byte, error)
+	}{
+		{"P2PKH", CreateSSFeeConsolidationOutput, ConsolidationAddrToPkScript},
+		{"P2SH", CreateSSFeeScriptHashConsolidationOutput, ConsolidationScriptHashToPkScript},
 	}
 
-	// Build a minimal vote transaction
-	tx := &wire.MsgTx{
-		TxOut: []*wire.TxOut{
-			{PkScript: make([]byte, 38)}, // [0] block reference
-			{PkScript: make([]byte, 4)},  // [1] vote bits
-			output,                       // [2] consolidation
-		},
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := tt.createOutput(testHash160)
+			if err != nil {
+				t.Fatalf("create output failed: %v", err)
+			}
 
-	// Extract hash160
-	extractedHash160, err := ExtractSSFeeConsolidationAddr(tx)
-	if err != nil {
-		t.Fatalf("ExtractSSFeeConsolidationAddr failed: %v", err)
-	}
+			// Build a minimal vote transaction
+			tx := &wire.MsgTx{
+				TxOut: []*wire.TxOut{
+					{PkScript: make([]byte, 38)}, // [0] block reference
+					{PkScript: make([]byte, 4)},  // [1] vote bits
+					output,                       // [2] consolidation
+				},
+			}
 
-	// Verify roundtrip
-	if !bytes.Equal(extractedHash160, testHash160) {
-		t.Fatalf("roundtrip failed\noriginal: %x\nextracted: %x",
-			testHash160, extractedHash160)
+			script, err := ExtractSSFeeConsolidationScript(tx)
+			if err != nil {
+				t.Fatalf("ExtractSSFeeConsolidationScript failed: %v", err)
+			}
+
+			want, err := tt.toPkScript(testHash160)
+			if err != nil {
+				t.Fatalf("pkScript failed: %v", err)
+			}
+			if !bytes.Equal(script, want) {
+				t.Fatalf("roundtrip failed\nwant: %x\ngot:  %x", want, script)
+			}
+
+			hash160, err := ExtractSSFeeConsolidationAddr(tx)
+			if err != nil {
+				t.Fatalf("ExtractSSFeeConsolidationAddr failed: %v", err)
+			}
+			if !bytes.Equal(hash160, testHash160) {
+				t.Fatalf("hash160 mismatch\nwant: %x\ngot:  %x", testHash160, hash160)
+			}
+		})
 	}
 }
 

@@ -1127,13 +1127,13 @@ func CheckSSGenVotes(tx *wire.MsgTx) ([]TreasuryVoteTuple, error) {
 	// hashes. If it is we need to decrease the count on OP_SSGEN tests by
 	// one.
 	//
-	// Note: The last output could also be a consolidation address ('S','C'),
-	// which is allowed. We only process treasury votes here.
+	// Note: The last output could also be a consolidation address ('S','C' or
+	// 'S','H'), which is allowed. We only process treasury votes here.
 	txOutLen := len(tx.TxOut)
 	lastTxOut := tx.TxOut[len(tx.TxOut)-1]
 	var votes []TreasuryVoteTuple
 	if IsNullDataScript(lastTxOut.Version, lastTxOut.PkScript) {
-		// Check if this is a treasury vote (TV) or consolidation address (SC)
+		// Check if this is a treasury vote (TV) or consolidation address (SC/SH)
 		// Only process if it's a treasury vote
 		//
 		// Determine start of discriminator based on the opcode in [1]
@@ -1179,24 +1179,20 @@ func CheckSSGenVotes(tx *wire.MsgTx) ([]TreasuryVoteTuple, error) {
 
 	// Ensure that a consolidation address output is present.
 	// This is required for UTXO consolidation of SSFee payments.
-	_, err := ExtractSSFeeConsolidationAddr(tx)
+	_, err := ExtractSSFeeConsolidationScript(tx)
 	if err != nil {
 		str := "SSGen must contain valid consolidation address output"
 		return nil, stakeRuleError(ErrSSGenMissingConsolidation, str)
 	}
 
 	// Ensure that the remaining outputs are OP_SSGEN tagged.
-	// Skip the consolidation address output (OP_RETURN with "SC" marker).
+	// Skip the consolidation address output (OP_RETURN with "SC" or "SH" marker).
 	for outTxIndex := 2; outTxIndex < txOutLen; outTxIndex++ {
 		scrVersion := tx.TxOut[outTxIndex].Version
 		rawScript := tx.TxOut[outTxIndex].PkScript
 
-		// Skip consolidation address output (OP_RETURN + "SC" + hash160)
-		if len(rawScript) == SSConsolidationOutputSize &&
-			rawScript[0] == 0x6a && // OP_RETURN
-			rawScript[1] == SSConsolidationOpData22 &&
-			rawScript[2] == SSConsolidationMarkerS &&
-			rawScript[3] == SSConsolidationMarkerC {
+		// Skip consolidation address output (OP_RETURN + "SC"/"SH" + hash160)
+		if hash160, _ := parseConsolidationOutput(rawScript); hash160 != nil {
 			continue
 		}
 

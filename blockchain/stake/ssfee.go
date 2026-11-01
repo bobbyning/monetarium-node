@@ -117,35 +117,62 @@ func CreateMinerSSFeeMarker(blockHeight int64) []byte {
 const (
 	// SSConsolidationOutputSize is the size of the consolidation address
 	// OP_RETURN output in vote transactions.
-	// Format: OP_RETURN + OP_DATA_22 + "SC" + hash160(20 bytes) = 24 bytes
+	// Format: OP_RETURN + OP_DATA_22 + "SC"/"SH" + hash160(20 bytes) = 24 bytes
 	SSConsolidationOutputSize = 24
 
-	// SSConsolidationMarkerS is the first byte of the "SC" marker.
+	// SSConsolidationMarkerS is the first byte of the "SC" and "SH" markers.
 	SSConsolidationMarkerS = 0x53 // 'S'
 
-	// SSConsolidationMarkerC is the second byte of the "SC" marker.
+	// SSConsolidationMarkerC is the second byte of the "SC" marker, which
+	// makes the hash160 a P2PKH address.
 	SSConsolidationMarkerC = 0x43 // 'C'
+
+	// SSConsolidationMarkerH is the second byte of the "SH" marker, which
+	// makes the hash160 a P2SH address.
+	SSConsolidationMarkerH = 0x48 // 'H'
 
 	// SSConsolidationOpData22 is the OP_DATA push size for consolidation output.
 	SSConsolidationOpData22 = 0x16 // 22 bytes
 )
 
-// ExtractSSFeeConsolidationAddr extracts the consolidation address hash160
-// from a vote (SSGen) transaction.
+// parseConsolidationOutput returns the hash160 of a consolidation address
+// output and whether it is a P2SH address.  The hash160 is nil when the script
+// is not a consolidation address output.
+func parseConsolidationOutput(script []byte) ([]byte, bool) {
+	if len(script) != SSConsolidationOutputSize ||
+		script[0] != standalone.SSFeeOpReturn ||
+		script[1] != SSConsolidationOpData22 ||
+		script[2] != SSConsolidationMarkerS {
+		return nil, false
+	}
+	switch script[3] {
+	case SSConsolidationMarkerC:
+		return script[4:24], false
+	case SSConsolidationMarkerH:
+		return script[4:24], true
+	}
+	return nil, false
+}
+
+// ExtractSSFeeConsolidationScript returns the script that staker SSFee
+// payments to the voter of a vote (SSGen) transaction must pay: the
+// OP_SSGEN-tagged P2PKH script of an "SC" consolidation address, or the
+// OP_SSGEN-tagged P2SH script of an "SH" one.
 //
 // Vote transaction outputs:
 //
 //	[0] Block reference (OP_RETURN + 40 bytes)
 //	[1] Vote bits (OP_RETURN + votebits)
 //	[2..N] VAR reward outputs (P2PKH/P2SH)
-//	[N+1] Consolidation address (OP_RETURN + "SC" + hash160)  ← This function extracts this
+//	[N+1] Consolidation address (OP_RETURN + "SC"/"SH" + hash160)  ← This function reads this
 //	[N+2] Treasury vote (OP_RETURN + "TV" + ...) [optional, always last]
 //
-// The function scans outputs from index 2 onwards, looking for the "SC" marker.
-// It stops before the last output if it's a treasury vote.
+// The function scans outputs from index 2 onwards and uses the first
+// consolidation address output.  It stops before the last output if it's a
+// treasury vote.
 //
-// Returns the 20-byte hash160 address or an error if not found or invalid.
-func ExtractSSFeeConsolidationAddr(voteTx *wire.MsgTx) ([]byte, error) {
+// Returns an error if no consolidation address output is found.
+func ExtractSSFeeConsolidationScript(voteTx *wire.MsgTx) ([]byte, error) {
 	// Need at least 3 outputs: block ref [0], vote bits [1], and consolidation [2+]
 	if len(voteTx.TxOut) < 3 {
 		return nil, fmt.Errorf("vote transaction has too few outputs (%d, need at least 3)",
@@ -168,37 +195,42 @@ func ExtractSSFeeConsolidationAddr(voteTx *wire.MsgTx) ([]byte, error) {
 
 	// Scan outputs from index 2 to endIdx-1 for consolidation marker
 	for i := 2; i < endIdx; i++ {
-		script := voteTx.TxOut[i].PkScript
-
-		// Check for correct length
-		if len(script) != SSConsolidationOutputSize {
+		hash160, isScriptHash := parseConsolidationOutput(voteTx.TxOut[i].PkScript)
+		if hash160 == nil {
 			continue
 		}
-
-		// Check format: OP_RETURN + OP_DATA_22 + "SC" + hash160
-		if script[0] != standalone.SSFeeOpReturn {
-			continue
+		if isScriptHash {
+			return ConsolidationScriptHashToPkScript(hash160)
 		}
-
-		if script[1] != SSConsolidationOpData22 {
-			continue
-		}
-
-		if script[2] != SSConsolidationMarkerS || script[3] != SSConsolidationMarkerC {
-			continue
-		}
-
-		// Extract and return hash160 (bytes 4-23)
-		hash160 := make([]byte, 20)
-		copy(hash160, script[4:24])
-		return hash160, nil
+		return ConsolidationAddrToPkScript(hash160)
 	}
 
 	return nil, fmt.Errorf("vote transaction missing consolidation address output")
 }
 
+// ExtractSSFeeConsolidationAddr returns the hash160 of the consolidation
+// address of a vote (SSGen) transaction, without its type: a P2SH ("SH")
+// address returns its hash160 like a P2PKH ("SC") one.  Callers that pay the
+// address must use ExtractSSFeeConsolidationScript, which keeps the type.
+//
+// It does not reject "SH", so that a block template generator built against
+// it does not fail on every template that includes such a vote.  Paying the
+// hash160 as P2PKH sends that voter's share to a script no key can satisfy,
+// as before "SH" existed, and validation that reads
+// ExtractSSFeeConsolidationScript rejects such a payout.
+func ExtractSSFeeConsolidationAddr(voteTx *wire.MsgTx) ([]byte, error) {
+	script, err := ExtractSSFeeConsolidationScript(voteTx)
+	if err != nil {
+		return nil, err
+	}
+	if isPubKeyHashScript(script[1:]) {
+		return script[4:24], nil
+	}
+	return script[3:23], nil
+}
+
 // CreateSSFeeConsolidationOutput creates an OP_RETURN output for vote construction
-// that specifies where SSFee payments should be sent.
+// that specifies the P2PKH address SSFee payments should be sent to.
 //
 // Format: OP_RETURN + OP_DATA_22 + "SC" + hash160(20 bytes) = 24 bytes
 //
@@ -211,6 +243,19 @@ func ExtractSSFeeConsolidationAddr(voteTx *wire.MsgTx) ([]byte, error) {
 // The returned TxOut has Value=0 and should be inserted into the vote transaction
 // after all reward outputs but before any treasury vote output.
 func CreateSSFeeConsolidationOutput(hash160 []byte) (*wire.TxOut, error) {
+	return createConsolidationOutput(SSConsolidationMarkerC, hash160)
+}
+
+// CreateSSFeeScriptHashConsolidationOutput is CreateSSFeeConsolidationOutput
+// for a P2SH address: the output carries the "SH" marker instead of "SC".
+func CreateSSFeeScriptHashConsolidationOutput(hash160 []byte) (*wire.TxOut, error) {
+	return createConsolidationOutput(SSConsolidationMarkerH, hash160)
+}
+
+// createConsolidationOutput returns a consolidation address output for hash160
+// whose second marker byte is marker, which must be SSConsolidationMarkerC or
+// SSConsolidationMarkerH.
+func createConsolidationOutput(marker byte, hash160 []byte) (*wire.TxOut, error) {
 	if len(hash160) != 20 {
 		return nil, fmt.Errorf("invalid hash160 length: %d (expected 20)", len(hash160))
 	}
@@ -219,7 +264,7 @@ func CreateSSFeeConsolidationOutput(hash160 []byte) (*wire.TxOut, error) {
 	script[0] = standalone.SSFeeOpReturn // OP_RETURN
 	script[1] = SSConsolidationOpData22  // OP_DATA_22
 	script[2] = SSConsolidationMarkerS   // 'S'
-	script[3] = SSConsolidationMarkerC   // 'C'
+	script[3] = marker                   // 'C' or 'H'
 	copy(script[4:24], hash160)          // hash160 (20 bytes)
 
 	return &wire.TxOut{
@@ -264,6 +309,26 @@ func ConsolidationAddrToPkScript(hash160 []byte) ([]byte, error) {
 	copy(script[4:24], hash160)
 	script[24] = 0x88 // OP_EQUALVERIFY
 	script[25] = 0xac // OP_CHECKSIG
+
+	return script, nil
+}
+
+// ConsolidationScriptHashToPkScript is ConsolidationAddrToPkScript for a P2SH
+// consolidation address: it returns the OP_SSGEN-tagged P2SH pkScript.
+//
+// Format: OP_SSGEN OP_HASH160 OP_DATA_20 <hash160> OP_EQUAL = 24 bytes
+func ConsolidationScriptHashToPkScript(hash160 []byte) ([]byte, error) {
+	if len(hash160) != 20 {
+		return nil, fmt.Errorf("invalid hash160 length: %d (expected 20)", len(hash160))
+	}
+
+	const opSSGen = 0xbb // txscript.OP_SSGEN
+	script := make([]byte, 24)
+	script[0] = opSSGen // OP_SSGEN
+	script[1] = 0xa9    // OP_HASH160
+	script[2] = 0x14    // OP_DATA_20
+	copy(script[3:23], hash160)
+	script[23] = 0x87 // OP_EQUAL
 
 	return script, nil
 }

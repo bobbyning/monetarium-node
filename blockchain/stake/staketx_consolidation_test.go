@@ -66,6 +66,64 @@ var ssgenMsgTxWithConsolidationAtPos2 = &wire.MsgTx{
 	Expiry:   0,
 }
 
+// ssgenMsgTxWithScriptHashConsolidation has a P2SH ("SH") consolidation address.
+var ssgenMsgTxWithScriptHashConsolidation = func() *wire.MsgTx {
+	output, err := CreateSSFeeScriptHashConsolidationOutput(ssgenConsolidationHash160)
+	if err != nil {
+		panic("failed to create test consolidation output: " + err.Error())
+	}
+	tx := ssgenMsgTxWithConsolidation.Copy()
+	tx.TxOut[4] = output
+	return tx
+}()
+
+// ssgenMsgTxWithScriptHashConsolidationAndTreasury has a P2SH consolidation
+// address followed by a treasury vote.
+var ssgenMsgTxWithScriptHashConsolidationAndTreasury = func() *wire.MsgTx {
+	tx := ssgenMsgTxWithConsolidationAndTreasury.Copy()
+	tx.TxOut[4] = ssgenMsgTxWithScriptHashConsolidation.TxOut[4]
+	return tx
+}()
+
+// ssgenMsgTxWithBothConsolidations has a P2SH consolidation address and then
+// a P2PKH one.
+var ssgenMsgTxWithBothConsolidations = func() *wire.MsgTx {
+	tx := ssgenMsgTxWithScriptHashConsolidation.Copy()
+	tx.TxOut = append(tx.TxOut, buildConsolidationOutput())
+	return tx
+}()
+
+// ssgenMsgTxWithMalformedScriptHash returns ssgenMsgTxWithScriptHashConsolidation
+// with its "SH" output script changed by mutate.  When withSC is true, the
+// malformed output follows a valid "SC" output instead of replacing it.
+func ssgenMsgTxWithMalformedScriptHash(withSC bool, mutate func([]byte) []byte) *wire.MsgTx {
+	sh := ssgenMsgTxWithScriptHashConsolidation.TxOut[4]
+	malformed := &wire.TxOut{
+		Value:    sh.Value,
+		CoinType: sh.CoinType,
+		Version:  sh.Version,
+		PkScript: mutate(append([]byte(nil), sh.PkScript...)),
+	}
+	if withSC {
+		tx := ssgenMsgTxWithConsolidation.Copy()
+		tx.TxOut = append(tx.TxOut, malformed)
+		return tx
+	}
+	tx := ssgenMsgTxWithScriptHashConsolidation.Copy()
+	tx.TxOut[4] = malformed
+	return tx
+}
+
+// Malformed "SH" consolidation outputs, each one property away from a valid one.
+var (
+	shWrongPush         = func(s []byte) []byte { s[1] = 0x15; return s } // OP_DATA_21
+	shNoOpReturn        = func(s []byte) []byte { s[0] = 0x00; return s } // OP_0
+	shWrongLength       = func(s []byte) []byte { return s[:23] }
+	shTooLong           = func(s []byte) []byte { return append(s, 0x00) }
+	shWrongFirstMarker  = func(s []byte) []byte { s[2] = 0x99; return s } // 0x99 'H'
+	shWrongSecondMarker = func(s []byte) []byte { s[3] = 0x99; return s } // 'S' 0x99
+)
+
 // ssgenMsgTxWithConsolidationAndTreasury has both consolidation and treasury vote.
 var ssgenMsgTxWithConsolidationAndTreasury = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
@@ -196,6 +254,18 @@ func TestCheckSSGenWithConsolidation(t *testing.T) {
 			name: "valid vote with consolidation and treasury vote",
 			tx:   ssgenMsgTxWithConsolidationAndTreasury,
 		},
+		{
+			name: "valid vote with P2SH consolidation",
+			tx:   ssgenMsgTxWithScriptHashConsolidation,
+		},
+		{
+			name: "valid vote with P2SH consolidation and treasury vote",
+			tx:   ssgenMsgTxWithScriptHashConsolidationAndTreasury,
+		},
+		{
+			name: "valid vote with P2SH and P2PKH consolidation",
+			tx:   ssgenMsgTxWithBothConsolidations,
+		},
 	}
 
 	for _, tt := range tests {
@@ -258,6 +328,54 @@ func TestCheckSSGenMissingConsolidation(t *testing.T) {
 			tx:        ssgenMsgTxInvalidConsolidationLength,
 			wantErr:   ErrSSGenMissingConsolidation,
 			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with SH consolidation with wrong push opcode",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shWrongPush),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with SH consolidation without OP_RETURN",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shNoOpReturn),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with SH consolidation of wrong length",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shWrongLength),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with SH consolidation one byte too long",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shTooLong),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with H marker and wrong first marker byte",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shWrongFirstMarker),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with S marker and wrong second marker byte",
+			tx:        ssgenMsgTxWithMalformedScriptHash(false, shWrongSecondMarker),
+			wantErr:   ErrSSGenMissingConsolidation,
+			errSubstr: "consolidation address",
+		},
+		{
+			name:      "vote with SC consolidation and SH output with wrong push opcode",
+			tx:        ssgenMsgTxWithMalformedScriptHash(true, shWrongPush),
+			wantErr:   ErrSSGenBadGenOuts,
+			errSubstr: "OP_SSGEN tagged",
+		},
+		{
+			name:      "vote with SC consolidation and SH output without OP_RETURN",
+			tx:        ssgenMsgTxWithMalformedScriptHash(true, shNoOpReturn),
+			wantErr:   ErrSSGenBadGenOuts,
+			errSubstr: "OP_SSGEN tagged",
 		},
 	}
 
@@ -336,6 +454,7 @@ func TestIsSSGenWithConsolidation(t *testing.T) {
 		ssgenMsgTxNoConsolidation,
 		ssgenMsgTxInvalidConsolidationMarker,
 		ssgenMsgTxInvalidConsolidationLength,
+		ssgenMsgTxWithMalformedScriptHash(false, shWrongSecondMarker),
 	}
 
 	for i, tx := range invalidVotes {
