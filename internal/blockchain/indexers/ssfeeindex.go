@@ -447,7 +447,8 @@ func (idx *SSFeeIndex) ConnectBlock(dbTx database.Tx, block *dcrutil.Block) erro
 		// Extract hash160 from the payment output
 		hash160, err := extractHash160FromPkScript(paymentOutput.PkScript)
 		if err != nil {
-			// Skip non-P2PKH outputs (shouldn't happen for valid SSFee)
+			// Skip non-P2PKH outputs, such as the P2SH payout to an "SH"
+			// consolidation address, which the generator never augments.
 			log.Debugf("SSFeeIndex: Skipping SSFee tx %s: failed to extract hash160: %v", stx.Hash(), err)
 			continue
 		}

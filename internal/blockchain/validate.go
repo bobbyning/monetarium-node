@@ -2664,12 +2664,12 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	// In Monetarium, consolidation addresses are mandatory from genesis - all votes
 	// must include a consolidation address output. We extract for all votes to validate
 	// that batched SSFees correctly group voters by consolidation address.
-	voterConsolidation := make(map[int][]byte) // voterIdx → hash160
+	voterConsolidation := make(map[int][]byte) // voterIdx → consolidation script
 	voterStakes := make(map[int]int64)         // voterIdx → stake amount
 	totalVoterStake := int64(0)
 
 	for i, vote := range votes {
-		hash160, err := stake.ExtractSSFeeConsolidationAddr(vote.MsgTx())
+		script, err := stake.ExtractSSFeeConsolidationScript(vote.MsgTx())
 		if err != nil {
 			// Consolidation addresses are mandatory in Monetarium from genesis.
 			// All votes must include a consolidation address output.
@@ -2677,7 +2677,7 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 				fmt.Sprintf("vote %d missing required consolidation address: %v",
 					i, err))
 		}
-		voterConsolidation[i] = hash160
+		voterConsolidation[i] = script
 
 		// Calculate voter stake from commitment outputs (indices 2+ until OP_RETURN)
 		voterStake := calculateVoterStake(vote.MsgTx())
@@ -2692,13 +2692,15 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	// Build expected equal-per-vote distribution by consolidation address.
 	// Every vote gets the same fee share regardless of ticket price.
 	// Since consolidation addresses are mandatory, this always runs for batched validation.
-	expectedDistribution := make(map[string]int64)       // key: "coinType_hash160hex" for VAR
-	expectedDistributionSKA := make(map[string]*big.Int) // key: "coinType_hash160hex" for SKA
+	expectedDistribution := make(map[string]int64)       // key: "coinType_scripthex" for VAR
+	expectedDistributionSKA := make(map[string]*big.Int) // key: "coinType_scripthex" for SKA
 
-	// Pre-calculate group voter counts (same for all coin types)
-	groupVoterCounts := make(map[string]int64) // key: hash160hex
-	for _, hash160 := range voterConsolidation {
-		key := hex.EncodeToString(hash160)
+	// Pre-calculate group voter counts (same for all coin types).  Every
+	// P2PKH script has the same bytes around its hash160, so sorting these
+	// keys orders P2PKH groups as sorting their hash160s did.
+	groupVoterCounts := make(map[string]int64) // key: scripthex
+	for _, script := range voterConsolidation {
+		key := hex.EncodeToString(script)
 		groupVoterCounts[key]++
 	}
 
@@ -2728,14 +2730,14 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 
 		// Calculate equal-per-vote fee for each group
 		// First sorted group gets remainder for deterministic results
-		for i, hash160Hex := range sortedKeys {
-			voterCount := groupVoterCounts[hash160Hex]
+		for i, scriptHex := range sortedKeys {
+			voterCount := groupVoterCounts[scriptHex]
 			groupFee := new(big.Int).Mul(feePerVoter, big.NewInt(voterCount))
 			// First group gets remainder
 			if i == 0 && remainder.Sign() > 0 {
 				groupFee.Add(groupFee, remainder)
 			}
-			distKey := makeDistributionKey(coinType, hash160Hex)
+			distKey := makeDistributionKey(coinType, scriptHex)
 
 			// Store in appropriate map based on coin type
 			if coinType.IsVAR() {
@@ -2910,9 +2912,9 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			// NOTE: With batched consolidation, we create ONE SSFee per unique consolidation
 			// address per coin type. Multiple voters with same address share one SSFee.
 
-			// Extract recipient hash160 from the payment output
+			// Read the recipient script from the payment output
 			// SKA uses bigint, VAR uses int64
-			var recipientHash160 []byte
+			var recipientScript []byte
 			var totalOutputValue int64
 			var totalOutputValueSKA *big.Int
 			if coinType.IsSKA() {
@@ -2925,20 +2927,14 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 					continue
 				}
 
-				recipientHash160, err = extractHash160FromPkScript(out.PkScript)
-				if err != nil {
+				// The payment must use the consolidation script of a voter,
+				// checked below, with script version 0.
+				if out.Version != 0 {
 					return ruleError(ErrStakeFees,
-						fmt.Sprintf("invalid SSFee payment script: %v", err))
+						fmt.Sprintf("staker SSFee payment script version %d "+
+							"is not 0", out.Version))
 				}
-
-				// The payment must use the consolidation script of its
-				// recipient.  The hash160 is 20 bytes, so this cannot fail.
-				payScript, _ := stake.ConsolidationAddrToPkScript(recipientHash160)
-				if out.Version != 0 || !bytes.Equal(out.PkScript, payScript) {
-					return ruleError(ErrStakeFees,
-						fmt.Sprintf("staker SSFee payment script is not the "+
-							"consolidation script of %x", recipientHash160))
-				}
+				recipientScript = out.PkScript
 
 				// Get the output value based on coin type
 				if coinType.IsSKA() {
@@ -2963,18 +2959,12 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 				}
 			}
 
-			// Verify recipient matches at least one voter's consolidation address
-			validRecipient := false
-			for _, voterHash160 := range voterConsolidation {
-				if bytes.Equal(recipientHash160, voterHash160) {
-					validRecipient = true
-					break
-				}
-			}
-			if !validRecipient {
+			// Verify recipient matches at least one voter's consolidation script
+			recipientHex := hex.EncodeToString(recipientScript)
+			if groupVoterCounts[recipientHex] == 0 {
 				return ruleError(ErrStakeFees,
-					fmt.Sprintf("SSFee recipient %x does not match any voter consolidation address",
-						recipientHash160))
+					fmt.Sprintf("SSFee recipient script %x does not match any voter consolidation script",
+						recipientScript))
 			}
 
 			// Calculate the fee distributed by this SSFee transaction
@@ -3028,7 +3018,7 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			}
 
 			// Track per-consolidation-address distribution for detailed validation
-			distKey := makeDistributionKey(coinType, hex.EncodeToString(recipientHash160))
+			distKey := makeDistributionKey(coinType, recipientHex)
 			if coinType.IsSKA() {
 				// Track SKA distribution using bigint
 				existing := actualDistributionSKA[distKey]
@@ -3131,10 +3121,10 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	return nil
 }
 
-// makeDistributionKey creates a unique key for (coinType, hash160) consolidation address.
+// makeDistributionKey creates a unique key for a (coinType, consolidation script) pair.
 // This is used to track expected vs actual SSFee distributions in batched consolidation.
-func makeDistributionKey(coinType cointype.CoinType, hash160Hex string) string {
-	return fmt.Sprintf("%d_%s", coinType, hash160Hex)
+func makeDistributionKey(coinType cointype.CoinType, scriptHex string) string {
+	return fmt.Sprintf("%d_%s", coinType, scriptHex)
 }
 
 // calculateVoterStake sums commitment outputs from a vote transaction.
@@ -3152,45 +3142,6 @@ func calculateVoterStake(voteTx *wire.MsgTx) int64 {
 		stake += output.Value
 	}
 	return stake
-}
-
-// extractHash160FromPkScript extracts the hash160 from a P2PKH or P2SH script.
-// P2PKH: OP_DUP OP_HASH160 OP_DATA_20 <hash160> OP_EQUALVERIFY OP_CHECKSIG (25 bytes)
-// P2SH:  OP_HASH160 OP_DATA_20 <hash160> OP_EQUAL (23 bytes)
-// Returns the 20-byte hash160 or an error if the script format is unsupported.
-func extractHash160FromPkScript(pkScript []byte) ([]byte, error) {
-	// OP_SSGEN-tagged P2PKH: 26 bytes (used by SSFee outputs)
-	// OP_SSGEN OP_DUP OP_HASH160 OP_DATA_20 <hash160> OP_EQUALVERIFY OP_CHECKSIG
-	if len(pkScript) == 26 &&
-		pkScript[0] == txscript.OP_SSGEN &&
-		pkScript[1] == txscript.OP_DUP &&
-		pkScript[2] == txscript.OP_HASH160 &&
-		pkScript[3] == 0x14 { // OP_DATA_20
-		hash160 := make([]byte, 20)
-		copy(hash160, pkScript[4:24])
-		return hash160, nil
-	}
-
-	// P2PKH: 25 bytes
-	if len(pkScript) == 25 &&
-		pkScript[0] == txscript.OP_DUP &&
-		pkScript[1] == txscript.OP_HASH160 &&
-		pkScript[2] == 0x14 { // OP_DATA_20
-		hash160 := make([]byte, 20)
-		copy(hash160, pkScript[3:23])
-		return hash160, nil
-	}
-
-	// P2SH: 23 bytes
-	if len(pkScript) == 23 &&
-		pkScript[0] == txscript.OP_HASH160 &&
-		pkScript[1] == 0x14 { // OP_DATA_20
-		hash160 := make([]byte, 20)
-		copy(hash160, pkScript[2:22])
-		return hash160, nil
-	}
-
-	return nil, fmt.Errorf("unsupported script type (len=%d)", len(pkScript))
 }
 
 // checkDupTxs ensures blocks do not contain duplicate transactions which

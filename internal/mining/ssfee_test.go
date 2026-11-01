@@ -5,13 +5,19 @@
 package mining
 
 import (
+	"bytes"
+	"context"
 	"math/big"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/blockchain/stake"
+	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/database"
+	_ "github.com/monetarium/monetarium-node/database/ffldb"
 	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/internal/blockchain/indexers"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/wire"
 )
@@ -587,4 +593,160 @@ func TestCreateSSFeeTxBatchedUTXOAugmentation(t *testing.T) {
 			}
 		}
 	})
+}
+
+// ssFeeScriptHashVote returns a mock vote whose consolidation address is the
+// P2SH ("SH") address of hash160.
+func ssFeeScriptHashVote(t *testing.T, hash160 []byte) *dcrutil.Tx {
+	t.Helper()
+	voteTx := createMockVoteWithConsolidation(1000, hash160).MsgTx()
+	out, err := stake.CreateSSFeeScriptHashConsolidationOutput(hash160)
+	if err != nil {
+		t.Fatal(err)
+	}
+	voteTx.TxOut[3] = out
+	return dcrutil.NewTx(voteTx)
+}
+
+// TestCreateSSFeeTxBatchedScriptHash ensures voters with a P2SH ("SH")
+// consolidation address are paid the OP_SSGEN-tagged P2SH script of that
+// address, in a group of their own apart from P2PKH voters of the same
+// hash160, and that groups are ordered by script: every P2PKH script sorts
+// before every P2SH script, so a P2PKH group takes the remainder even when a
+// P2SH group has the smaller hash160.
+func TestCreateSSFeeTxBatchedScriptHash(t *testing.T) {
+	addr := bytes.Repeat([]byte{0x01}, 20)
+	highAddr := bytes.Repeat([]byte{0x02}, 20)
+	p2shVote := ssFeeScriptHashVote(t, addr)
+
+	p2pkhScript, _ := stake.ConsolidationAddrToPkScript(addr)
+	p2shScript, _ := stake.ConsolidationScriptHashToPkScript(addr)
+	highP2PKHScript, _ := stake.ConsolidationAddrToPkScript(highAddr)
+	type payout struct {
+		script []byte
+		amount int64
+	}
+	tests := []struct {
+		name   string
+		voters []*dcrutil.Tx
+		want   []payout
+	}{{
+		name: "same hash160",
+		voters: []*dcrutil.Tx{p2shVote,
+			createMockVoteWithConsolidation(1000, addr), p2shVote},
+		want: []payout{{p2pkhScript, 1001}, {p2shScript, 2000}},
+	}, {
+		name: "P2SH voter with the smaller hash160",
+		voters: []*dcrutil.Tx{p2shVote,
+			createMockVoteWithConsolidation(1000, highAddr)},
+		want: []payout{{highP2PKHScript, 1501}, {p2shScript, 1500}},
+	}}
+
+	for _, test := range tests {
+		for _, coinType := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
+			txns, err := createSSFeeTxBatched(coinType, big.NewInt(3001),
+				test.voters, 100, nil, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("%s/%v: unexpected error: %v", test.name, coinType, err)
+			}
+			if len(txns) != len(test.want) {
+				t.Fatalf("%s/%v: got %d SSFee transactions, want %d", test.name,
+					coinType, len(txns), len(test.want))
+			}
+			for i, tx := range txns {
+				payOut := tx.MsgTx().TxOut[1]
+				if !bytes.Equal(payOut.PkScript, test.want[i].script) ||
+					payOut.Version != 0 {
+
+					t.Errorf("%s/%v: SSFee %d pays script %x version %d, want "+
+						"%x version 0", test.name, coinType, i, payOut.PkScript,
+						payOut.Version, test.want[i].script)
+				}
+				if payOut.CoinType != coinType {
+					t.Errorf("%s/%v: SSFee %d pays coin type %v", test.name,
+						coinType, i, payOut.CoinType)
+				}
+				amount := big.NewInt(payOut.Value)
+				if coinType.IsSKA() {
+					amount = payOut.SKAValue
+				}
+				if amount.Cmp(big.NewInt(test.want[i].amount)) != 0 {
+					t.Errorf("%s/%v: SSFee %d pays %v, want %d", test.name,
+						coinType, i, amount, test.want[i].amount)
+				}
+			}
+		}
+	}
+}
+
+// ssFeeIndexTestChain is the chain of an SSFee index in tests.  The index
+// only needs the chain parameters to start on an empty database.
+type ssFeeIndexTestChain struct {
+	indexers.ChainQueryer
+}
+
+func (ssFeeIndexTestChain) ChainParams() *chaincfg.Params {
+	return chaincfg.SimNetParams()
+}
+
+// viewCountDB counts the read transactions on a database, which is how an
+// SSFee index lookup starts.
+type viewCountDB struct {
+	database.DB
+	views int
+}
+
+func (db *viewCountDB) View(fn func(database.Tx) error) error {
+	db.views++
+	return db.DB.View(fn)
+}
+
+// TestCreateSSFeeTxBatchedScriptHashNoIndexLookup ensures the generator does
+// not look up the SSFee index for a P2SH group, whose outputs the index never
+// files, and does look it up for a P2PKH group of the same hash160.
+func TestCreateSSFeeTxBatchedScriptHashNoIndexLookup(t *testing.T) {
+	ffldb, err := database.Create("ffldb", t.TempDir(), wire.SimNet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ffldb.Close() })
+	db := &viewCountDB{DB: ffldb}
+	subscriber := indexers.NewIndexSubscriber(context.Background())
+	idx, err := indexers.NewSSFeeIndex(subscriber, db, ssFeeIndexTestChain{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := bytes.Repeat([]byte{0x01}, 20)
+	tests := []struct {
+		name      string
+		voter     *dcrutil.Tx
+		wantViews bool
+	}{{
+		name:  "P2SH group",
+		voter: ssFeeScriptHashVote(t, addr),
+	}, {
+		name:      "P2PKH group",
+		voter:     createMockVoteWithConsolidation(1000, addr),
+		wantViews: true,
+	}}
+
+	for _, test := range tests {
+		for _, coinType := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
+			db.views = 0
+			txns, err := createSSFeeTxBatched(coinType, big.NewInt(3001),
+				[]*dcrutil.Tx{test.voter}, 100, idx, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("%s/%v: unexpected error: %v", test.name, coinType, err)
+			}
+			if len(txns) != 1 {
+				t.Fatalf("%s/%v: got %d SSFee transactions, want 1", test.name,
+					coinType, len(txns))
+			}
+			if gotViews := db.views > 0; gotViews != test.wantViews {
+				t.Errorf("%s/%v: index looked up %d time(s), want lookup %v",
+					test.name, coinType, db.views, test.wantViews)
+			}
+		}
+	}
 }

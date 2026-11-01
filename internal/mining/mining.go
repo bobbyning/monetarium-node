@@ -788,30 +788,30 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 	// consolidationGroup represents a group of voters with the same consolidation address
 	type consolidationGroup struct {
 		voterIndices []int  // Indices into voters array
-		hash160      []byte // Consolidation address hash160
+		script       []byte // Consolidation script the group's SSFee pays
 	}
 
-	// Step 1: Extract consolidation addresses from votes and group voters
-	groups := make(map[string]*consolidationGroup) // key: hex(hash160)
+	// Step 1: Extract consolidation scripts from votes and group voters
+	groups := make(map[string]*consolidationGroup) // key: hex(script)
 
 	for i, voter := range voters {
 		voteTx := voter.MsgTx()
 
-		// Extract consolidation address from vote
-		hash160, err := stake.ExtractSSFeeConsolidationAddr(voteTx)
+		// Extract consolidation script from vote
+		script, err := stake.ExtractSSFeeConsolidationScript(voteTx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract consolidation address from vote %s: %w",
 				voter.Hash(), err)
 		}
 
-		// Group by consolidation address
-		key := hex.EncodeToString(hash160)
+		// Group by consolidation script
+		key := hex.EncodeToString(script)
 		if group, exists := groups[key]; exists {
 			group.voterIndices = append(group.voterIndices, i)
 		} else {
 			groups[key] = &consolidationGroup{
 				voterIndices: []int{i},
-				hash160:      hash160,
+				script:       script,
 			}
 		}
 	}
@@ -847,11 +847,7 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 			continue
 		}
 
-		// Convert hash160 to P2PKH pkScript for recipient output
-		recipientPkScript, err := stake.ConsolidationAddrToPkScript(group.hash160)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert hash160 to pkScript: %w", err)
-		}
+		recipientPkScript := group.script
 
 		// Step 3: Look up existing UTXO for augmentation (if index provided)
 		var existingOutpoint *wire.OutPoint
@@ -859,9 +855,12 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 		var existingBlockHeight int64
 		var existingBlockIndex uint32
 
-		if ssfeeIndex != nil {
+		// The SSFee index files only P2PKH outputs, so a P2SH group always
+		// gets a new output.
+		pkHash := stdscript.ExtractStakeGenPubKeyHashV0(recipientPkScript)
+		if ssfeeIndex != nil && pkHash != nil {
 			// isMiner=false for staker SSFee
-			outpoint, value, blockHeight, blockIndex, err := ssfeeIndex.LookupUTXO(false, coinType, group.hash160)
+			outpoint, value, blockHeight, blockIndex, err := ssfeeIndex.LookupUTXO(false, coinType, pkHash)
 			if err != nil {
 				// Log but don't fail - fall back to null input
 				log.Debugf("Failed to query SSFeeIndex for UTXO lookup: %v", err)
@@ -920,12 +919,12 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 					existingValue = value
 					existingBlockHeight = blockHeight
 					existingBlockIndex = blockIndex
-					log.Debugf("Found augmentable UTXO %v (value=%v, height=%d, index=%d) for consolidation address %x",
-						outpoint, value, blockHeight, blockIndex, group.hash160)
+					log.Debugf("Found augmentable UTXO %v (value=%v, height=%d, index=%d) for consolidation script %x",
+						outpoint, value, blockHeight, blockIndex, recipientPkScript)
 				}
 			} else if outpoint == nil {
-				log.Debugf("No existing UTXO found in SSFeeIndex for consolidation address %x (will create new UTXO)",
-					group.hash160)
+				log.Debugf("No existing UTXO found in SSFeeIndex for consolidation script %x (will create new UTXO)",
+					recipientPkScript)
 			}
 		}
 
