@@ -4844,10 +4844,6 @@ func (b *BlockChain) checkTransactionsAndConnect(inputFees dcrutil.Amount,
 	// expensive (though still relatively cheap as compared to running the
 	// scripts) checks against all the inputs when the signature operations
 	// are out of bounds.
-	var inFlightRegularTx map[chainhash.Hash]uint32
-	if !stakeTree {
-		inFlightRegularTx = make(map[chainhash.Hash]uint32, len(txs))
-	}
 	totalFees := wire.NewFeesByType()
 	if inputFees > 0 {
 		// Carry forward stake tree fees (assumed to be VAR for now)
@@ -4904,15 +4900,11 @@ func (b *BlockChain) checkTransactionsAndConnect(inputFees dcrutil.Amount,
 		// and add all of the outputs for this transaction which are not
 		// provably unspendable as available utxos.
 		//
-		// For the regular transaction tree, keep track of in-flight
-		// transactions in order detect spends of earlier outputs by
-		// transactions later in the same block.
-		//
 		// Also, update the passed spent txos slice to contain an entry for each
 		// output the transaction spends.
 		if !stakeTree {
 			err := view.connectRegularTransaction(tx, node.height, uint32(idx),
-				inFlightRegularTx, stxos, isTreasuryEnabled)
+				stxos, isTreasuryEnabled)
 			if err != nil {
 				return err
 			}
@@ -4923,6 +4915,9 @@ func (b *BlockChain) checkTransactionsAndConnect(inputFees dcrutil.Amount,
 				return err
 			}
 		}
+	}
+	if !stakeTree {
+		view.zeroConfOuts = nil
 	}
 
 	// The total output values of the coinbase transaction must not exceed
