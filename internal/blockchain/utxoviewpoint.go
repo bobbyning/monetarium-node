@@ -631,7 +631,7 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 			entry := view.entries[txIn.PreviousOutPoint]
 			if entry == nil {
 				entry = &UtxoEntry{
-					amount:        txIn.ValueIn,
+					amount:        stxo.amount,
 					pkScript:      stxo.pkScript,
 					ticketMinOuts: stxo.ticketMinOuts,
 					blockHeight:   stxo.blockHeight,

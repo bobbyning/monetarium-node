@@ -645,8 +645,11 @@ func decodeSpentTxOut(serialized []byte, stxo *spentTxOut, amount int64,
 	coinType := cointype.CoinType(serialized[offset])
 	offset++
 
-	// Populate the stxo.
+	// Populate the stxo.  SKA outputs carry no VAR amount.
 	stxo.amount = amount
+	if coinType.IsSKA() {
+		stxo.amount = 0
+	}
 	stxo.pkScript = script
 	stxo.blockHeight = height
 	stxo.blockIndex = index

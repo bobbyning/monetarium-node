@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"math/big"
 	"reflect"
 	"testing"
 	"time"
@@ -707,6 +708,50 @@ func TestSpendJournalSerialization(t *testing.T) {
 			"b359688ac0000206a1e9ac39159847e259c9162405b5f6c8135d2c7eaf1a3750400010" +
 			"00000005800001abd76a914000000000000000000000000000000000000000088ac010" +
 			"000b3c2069c496bc13228c154b03993809f278233d100"),
+	}, {
+		// The spent SKA output carries no VAR amount, whatever the ValueIn of
+		// the input spending it holds.
+		name: "One regular tx that spends an SKA output with a non-zero ValueIn",
+		entry: []spentTxOut{{
+			amount:        0,
+			skaAmount:     big.NewInt(5e17),
+			scriptVersion: 0,
+			pkScript: hexToBytes("76a914b3c2069c496bc13228c154b03993809f278233" +
+				"d188ac"),
+			blockHeight: 100000,
+			blockIndex:  1,
+			coinType:    1,
+			packedFlags: encodeFlags(
+				noCoinbase,
+				noExpiry,
+				stake.TxTypeRegular,
+			),
+		}},
+		blockTxns: []*wire.MsgTx{{
+			SerType: wire.TxSerializeFull,
+			Version: 1,
+			TxIn: []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  chainhash.Hash{0x09},
+					Index: 0,
+					Tree:  0,
+				},
+				Sequence:    0xffffffff,
+				BlockHeight: 100000,
+				BlockIndex:  1,
+				ValueIn:     7e8,
+				SKAValueIn:  big.NewInt(5e17),
+			}},
+			TxOut: []*wire.TxOut{{
+				CoinType: 1,
+				SKAValue: big.NewInt(4e17),
+				Version:  0,
+				PkScript: hexToBytes("76a9142bf10bc24646c590d16b35b925cf7ad3c5aef0b28" +
+					"8ac"),
+			}},
+		}},
+		// flags + scriptVersion + pkScript + coinType(01)
+		serialized: hexToBytes("000000b3c2069c496bc13228c154b03993809f278233d101"),
 	}}
 
 	for _, test := range tests {
