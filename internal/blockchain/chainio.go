@@ -690,6 +690,10 @@ func deserializeSpendJournalEntry(serialized []byte, txns []*wire.MsgTx) ([]spen
 	// Calculate the total number of stxos.
 	var numStxos int
 	for _, tx := range txns {
+		// SKA emission transactions have a null input that spends nothing.
+		if wire.IsSKAEmissionTransaction(tx) {
+			continue
+		}
 		if stake.IsSSGen(tx) {
 			numStxos++
 			continue
@@ -727,6 +731,11 @@ func deserializeSpendJournalEntry(serialized []byte, txns []*wire.MsgTx) ([]spen
 	for txIdx := len(txns) - 1; txIdx > -1; txIdx-- {
 		tx := txns[txIdx]
 		isVote := stake.IsSSGen(tx)
+
+		// SKA emission transactions have a null input that spends nothing.
+		if wire.IsSKAEmissionTransaction(tx) {
+			continue
+		}
 
 		// Only skip null-input SSFee (creates new UTXO from scratch).
 		// Augmented SSFee (real input) spends a previous SSFee output.

@@ -603,13 +603,15 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 		}
 
 		// Loop backwards through all of the transaction inputs (except for the
-		// coinbase, treasurybase, treasury spends, and null-input SSFee which have no inputs)
-		// and unspend the referenced txos.  This is necessary to match the order
-		// of the spent txout entries.
+		// coinbase, treasurybase, treasury spends, null-input SSFee, and SKA
+		// emissions which have no inputs) and unspend the referenced txos.
+		// This is necessary to match the order of the spent txout entries.
 		isSSFee := txType == stake.TxTypeSSFee
 		isNullInputSSFee := isSSFee && len(msgTx.TxIn) > 0 &&
 			msgTx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex
-		if isCoinBase || isTreasuryBase || isTreasurySpend || isNullInputSSFee {
+		isSKAEmission := !stakeTree && wire.IsSKAEmissionTransaction(msgTx)
+		if isCoinBase || isTreasuryBase || isTreasurySpend || isNullInputSSFee ||
+			isSKAEmission {
 			continue
 		}
 		// Augmented SSFee (real input) continues to unspend its inputs
