@@ -182,13 +182,14 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	}
 
 	// Create blocks that distribute the SKA1 fee scaled by the number of
-	// votes, as VAR fees are, and more than the fee, a block without the miner
-	// SSFee transaction and blocks whose miner or staker SSFee transaction
-	// alone pays one atom more.
+	// votes, as VAR fees are, and more than the fee, blocks without the miner
+	// SSFee transaction and without either SSFee transaction, and blocks whose
+	// miner or staker SSFee transaction alone pays one atom more.
 	//
 	//   ... -> bska5 -> bscaled
 	//              \-> bover
 	//              \-> bnominer
+	//              \-> bnossfee
 	//              \-> bminerover
 	//              \-> bstakerover
 	const votes = 4
@@ -203,6 +204,9 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 		{name: "bover", distFee: new(big.Int).Add(fee, big.NewInt(2))},
 		{name: "bnominer", distFee: fee, munger: func(b *wire.MsgBlock) {
 			b.STransactions = b.STransactions[:len(b.STransactions)-1]
+		}},
+		{name: "bnossfee", distFee: fee, munger: func(b *wire.MsgBlock) {
+			b.STransactions = b.STransactions[:len(b.STransactions)-2]
 		}},
 		{name: "bminerover", distFee: fee, munger: func(b *wire.MsgBlock) {
 			out := b.STransactions[len(b.STransactions)-1].TxOut[1]
@@ -229,6 +233,81 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	//   ... -> bska5 -> bska4
 	g.SetTip("bska5")
 	g.NextBlock("bska4", nil, nil, g.ReplaceWithNVotes(votes), spendChange(fee))
+	g.AcceptTipBlock()
+}
+
+// TestSSFeeRequiredForFees ensures a block without SSFee transactions is
+// accepted only when it has no staker fees and no SKA miner fees to distribute.
+func TestSSFeeRequiredForFees(t *testing.T) {
+	addrA := []byte{1: 0xaa, 19: 0x01}
+	addrB := []byte{1: 0xbb, 19: 0x02}
+	votes := []*dcrutil.Tx{ssFeeTestVote(t, addrA), ssFeeTestVote(t, addrB),
+		ssFeeTestVote(t, addrA)}
+
+	tests := []struct {
+		name     string
+		coinType cointype.CoinType
+		fee      int64
+		wantErr  bool
+	}{{
+		name:     "no fees",
+		coinType: cointype.CoinTypeVAR,
+	}, {
+		name:     "one-atom VAR fee, which goes to the miner",
+		coinType: cointype.CoinTypeVAR,
+		fee:      1,
+	}, {
+		name:     "VAR fees without SSFee",
+		coinType: cointype.CoinTypeVAR,
+		fee:      2_007,
+		wantErr:  true,
+	}, {
+		name:     "one-atom SKA1 fee without SSFee",
+		coinType: 1,
+		fee:      1,
+		wantErr:  true,
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fees := wire.NewFeesByType()
+			fees.AddBig(test.coinType, big.NewInt(test.fee))
+			err := (&BlockChain{}).validateSSFeeTxns(nil, nil, votes, nil,
+				fees, standalone.SSVMonetarium)
+			if errors.Is(err, ErrStakeFees) != test.wantErr ||
+				!test.wantErr && err != nil {
+
+				t.Fatalf("got error %v, want %v: %v", err, ErrStakeFees,
+					test.wantErr)
+			}
+		})
+	}
+}
+
+// TestSSFeeRequiredForVARFees ensures a block whose VAR fees, scaled by its
+// votes, leave the stakers a share is rejected without its staker SSFee
+// transaction, and a block whose scaled fees leave them none is accepted
+// without one.
+func TestSSFeeRequiredForVARFees(t *testing.T) {
+	g := newChaingenHarness(t, chaincfg.RegNetParams())
+	g.AdvanceToStakeValidationHeight()
+
+	// The spend pays a fee of two atoms.  With all five votes the stakers
+	// get one of them, and with three votes the fee scales to one atom, which
+	// goes to the miner.
+	//
+	//   ... -> bnossfee
+	//     \-> bthreevotes
+	tip := g.TipName()
+	outs := g.OldestCoinbaseOuts()
+	g.NextBlock("bnossfee", &outs[0], nil, func(b *wire.MsgBlock) {
+		// The staker SSFee transaction is the last stake transaction.
+		b.STransactions = b.STransactions[:len(b.STransactions)-1]
+	})
+	g.RejectTipBlock(ErrStakeFees)
+
+	g.SetTip(tip)
+	g.NextBlock("bthreevotes", &outs[0], nil, g.ReplaceWithNVotes(3))
 	g.AcceptTipBlock()
 }
 

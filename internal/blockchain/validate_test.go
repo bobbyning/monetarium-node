@@ -2057,11 +2057,13 @@ func TestAutoRevocations(t *testing.T) {
 	g.RejectTipBlock(ErrRegTxCreateStakeOut)
 
 	// Create a valid block that misses multiple votes and contains revocation
-	// transactions for those votes.
+	// transactions for those votes.  The block buys no tickets, since
+	// ReplaceWithNVotes leaves the stake tree fees out of the staker SSFee it
+	// rebuilds.
 	//
 	//   ... -> b4(0)
 	g.SetTip(startTip)
-	g.NextBlock("b4", outs[0], ticketOuts[0], g.ReplaceWithNVotes(3),
+	g.NextBlock("b4", outs[0], nil, g.ReplaceWithNVotes(3),
 		g.CreateRevocationsForMissedTickets(), replaceAutoRevocationsVersions)
 	g.AssertTipNumRevocations(2)
 	g.AcceptTipBlock()

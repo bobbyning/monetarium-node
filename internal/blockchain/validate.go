@@ -2577,9 +2577,24 @@ func getSSFeeType(tx *wire.MsgTx) (string, error) {
 func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	votes []*dcrutil.Tx, ssFeeTxns []*wire.MsgTx, totalFees wire.FeesByType, subsidySplitVariant standalone.SubsidySplitVariant) error {
 
-	// No validation needed if there are no SSFee transactions
+	// Calculate miner's and staker's share of fees by coin type
+	work, stakeSubsidy, _, _ := standalone.GetSubsidyProportions(subsidySplitVariant)
+	minerFeesByType, stakerFeesByType := wire.CalcFeeSplitByCoinType(totalFees, work, stakeSubsidy)
+
+	// A block needs no SSFee transaction when it has no staker fees and no
+	// non-VAR miner fees to distribute.  Otherwise the checks below reject a
+	// block that lacks one.
 	if len(ssFeeTxns) == 0 {
-		return nil
+		needSSFee := false
+		for _, fee := range stakerFeesByType {
+			needSSFee = needSSFee || fee.Sign() > 0
+		}
+		for coinType, fee := range minerFeesByType {
+			needSSFee = needSSFee || (coinType.IsSKA() && fee.Sign() > 0)
+		}
+		if !needSSFee {
+			return nil
+		}
 	}
 
 	// Extract voter consolidation addresses and calculate stakes for validation.
@@ -2610,10 +2625,6 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 		voterStakes[i] = voterStake
 		totalVoterStake += voterStake
 	}
-
-	// Calculate miner's and staker's share of fees by coin type
-	work, stakeSubsidy, _, _ := standalone.GetSubsidyProportions(subsidySplitVariant)
-	minerFeesByType, stakerFeesByType := wire.CalcFeeSplitByCoinType(totalFees, work, stakeSubsidy)
 
 	// Build expected equal-per-vote distribution by consolidation address.
 	// Every vote gets the same fee share regardless of ticket price.
@@ -5462,14 +5473,15 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 			}
 		}
 
-		// Validate SSFee transactions if any exist
+		// Validate the SSFee transactions, which a block with fees to
+		// distribute must have.
 		if len(ssFeeTxns) > 0 {
 			log.Infof("Validating %d SSFee transaction(s) for block height %d with total fees %v (voters=%d)",
 				len(ssFeeTxns), node.height, distributedFees, node.voters)
-			err = b.validateSSFeeTxns(block, node, votes, ssFeeTxns, distributedFees, subsidySplitVariant)
-			if err != nil {
-				return err
-			}
+		}
+		err = b.validateSSFeeTxns(block, node, votes, ssFeeTxns, distributedFees, subsidySplitVariant)
+		if err != nil {
+			return err
 		}
 	}
 
