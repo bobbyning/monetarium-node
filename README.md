@@ -110,6 +110,39 @@ The script downloads the latest release binaries, creates configs, and sets up t
 node daemon + wallet. On Linux/macOS it creates a systemd service; on Windows it
 creates a scheduled task.
 
+### Updating an existing node (Linux / macOS)
+
+Re-run the same install command on a machine where Monetarium is already
+installed and the script switches to **update mode** automatically. No flags are
+needed. Update mode only:
+
+1. Downloads the latest official release binaries.
+2. Replaces `/usr/local/bin/monetarium-{node,wallet,ctl}` — and only those whose
+   published checksum differs from the installed binary.
+3. Restarts a service only if its binary changed **and** it was running before
+   the update. A service you stopped stays stopped.
+
+It never touches your config files, wallet database, service units,
+`install.manifest`, mining/voting settings, and it never asks for the wallet
+passphrase. Run it as your normal user, or with `sudo` (the real user is then
+detected via `SUDO_USER`). A **fresh install** should be run as the account that
+will own the node, not via `sudo`.
+
+If the download or checksum verification of any binary fails, the update aborts
+before anything is replaced. There is no automatic rollback: if a service fails
+to come back up, the script exits non-zero so you can inspect the logs
+(`journalctl -u monetarium-node -n 50` on Linux, `launchctl print
+gui/$(id -u)/com.monetarium.node` on macOS).
+
+A re-run cannot re-trigger the setup wizard. To reconfigure from scratch, remove
+the configs under `~/.monetarium` and re-run, which is treated as a fresh
+install.
+
+If the script finds binaries but no configs or services (for example an
+incomplete manual setup), it asks whether to update the binaries or run a full
+install. In a non-interactive context (cron, CI) it exits with an error instead
+of guessing.
+
 For a detailed walkthrough — what gets installed, how to verify the node, wallet
 and balance, checking logs, troubleshooting, and uninstalling — see
 [QUICK_START.md](https://github.com/monetarium/monetarium/blob/main/docs/QUICK_START.md).

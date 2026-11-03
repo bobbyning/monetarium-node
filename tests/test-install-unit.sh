@@ -14,6 +14,11 @@
 #   - download_binary (fresh install, skip-when-current, self-update,
 #     checksum-mismatch abort, no-digest and unreachable-API fallbacks)
 #   - restart_monetarium_services (systemctl + launchctl paths)
+#   - update mode: detect_install_mode matrix (fresh/update/repair/ambiguous),
+#     run_update binary swaps + restart matrix (changed only, active only,
+#     stale inode), staged abort, config/wallet preservation and the
+#     "never run the install-time steps" contract
+#   - install_staged_binaries (atomic swap + --version smoke test)
 #   - configure_mining_and_voting generate/miningaddr guards, including the
 #     re-run behaviour (carried-over mining config is preserved instead of
 #     silently forcing generate=false)
@@ -118,6 +123,7 @@ case "$url" in
     *"/releases/latest"*)
         [[ "${MOCK_CURL_API_FAIL:-0}" != "1" ]] || exit 1
         repo="$(printf '%s' "$url" | sed -E 's#.*/repos/[^/]+/([^/]+)/releases/latest#\1#')"
+        [[ "$repo" != "${MOCK_CURL_REPO_FAIL:-}" ]] || exit 1
         cat "$MOCK_STATE/$repo.json"
         exit 0
         ;;
@@ -172,6 +178,14 @@ case "${1:-}" in
             *monetarium-node*)   exit "${NODE_ACTIVE:-0}" ;;
             *monetarium-wallet*) exit "${WALLET_ACTIVE:-0}" ;;
             *) exit 1 ;;
+        esac
+        ;;
+    show)
+        # `systemctl show -p MainPID --value <svc>`
+        case "$*" in
+            *monetarium-node*)   echo "${NODE_PID:-0}" ;;
+            *monetarium-wallet*) echo "${WALLET_PID:-0}" ;;
+            *) echo "0" ;;
         esac
         ;;
 esac
@@ -1115,6 +1129,474 @@ run_summary_not_requested_test() {
     )
 }
 check "mining not requested → plain 'disabled'" run_summary_not_requested_test
+
+# --------------------------------------------------------------------------
+# Update mode: detection + binary-only update
+# --------------------------------------------------------------------------
+echo ""
+echo "============================================"
+echo "  update mode detection tests"
+echo "============================================"
+
+# Every detection/update test runs in a subshell: install.sh globals such as
+# IS_UPDATE_MODE, INSTALL_DIR and SYSTEMD_UNIT_DIR stay isolated per case.
+reset_detect_env() {
+    rm -rf "$MONETARIUM_HOME" "$TEST_TMP/systemd" "$TEST_TMP/runhome" "$INSTALL_TEST_DIR"
+    mkdir -p "$MONETARIUM_HOME" "$TEST_TMP/systemd" "$TEST_TMP/runhome" "$INSTALL_TEST_DIR"
+    INSTALL_DIR="$INSTALL_TEST_DIR"
+    SYSTEMD_UNIT_DIR="$TEST_TMP/systemd"
+    RUN_HOME="$TEST_TMP/runhome"
+    IS_UPDATE_MODE=false
+}
+
+make_configs() {
+    printf 'node-conf\n' > "$NODE_CONF"
+    printf 'wallet-conf\n' > "$WALLET_CONF"
+}
+
+make_wallet_db() {
+    mkdir -p "$(wallet_data_dir)/mainnet"
+    printf 'wallet-db\n' > "$(wallet_data_dir)/mainnet/wallet.db"
+}
+
+make_service_unit() {
+    printf 'unit\n' > "$SYSTEMD_UNIT_DIR/monetarium-node.service"
+}
+
+make_binaries() {
+    local b
+    for b in monetarium-node monetarium-wallet monetarium-ctl; do
+        printf '#!/usr/bin/env bash\necho old\n' > "$INSTALL_DIR/$b"
+        chmod +x "$INSTALL_DIR/$b"
+    done
+}
+
+run_detect_fresh_test() {
+    (
+        set +e
+        reset_detect_env
+        uname() { echo Linux; }
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "false" ]]
+    )
+}
+check "detect: nothing installed → install mode" run_detect_fresh_test
+
+run_detect_configs_test() {
+    (
+        set +e
+        reset_detect_env
+        make_configs
+        uname() { echo Linux; }
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "true" ]]
+    )
+}
+check "detect: configs present, binaries missing → update/repair" run_detect_configs_test
+
+run_detect_configs_and_unit_test() {
+    (
+        set +e
+        reset_detect_env
+        make_configs
+        make_service_unit
+        uname() { echo Linux; }
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "true" ]]
+    )
+}
+check "detect: configs + service unit → update" run_detect_configs_and_unit_test
+
+run_detect_unit_only_test() {
+    (
+        set +e
+        reset_detect_env
+        make_service_unit
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "false" ]]
+    )
+}
+check "detect: service unit without configs → full install" run_detect_unit_only_test
+
+run_detect_service_and_wallet_no_configs_test() {
+    (
+        set +e
+        reset_detect_env
+        make_service_unit
+        make_wallet_db
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: service + wallet DB, no configs → asks (no TTY aborts)" run_detect_service_and_wallet_no_configs_test
+
+run_detect_binaries_only_no_tty_test() {
+    (
+        set +e
+        reset_detect_env
+        make_binaries
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: binaries only, no TTY → aborts instead of guessing" run_detect_binaries_only_no_tty_test
+
+# Fake read_tty: stores the chosen answer in the variable name passed last.
+fake_read_choice() {
+    local __last
+    for __last in "$@"; do :; done
+    printf -v "$__last" '%s' "${UPDATE_CHOICE:-}"
+}
+
+run_detect_binaries_only_choose_update_test() {
+    (
+        set +e
+        reset_detect_env
+        make_binaries
+        uname() { echo Linux; }
+        has_tty() { return 0; }
+        read_tty() { fake_read_choice "$@"; }
+        UPDATE_CHOICE=1
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "true" ]]
+    )
+}
+check "detect: binaries only + choice 1 → update" run_detect_binaries_only_choose_update_test
+
+run_detect_binaries_only_choose_install_test() {
+    (
+        set +e
+        reset_detect_env
+        make_binaries
+        uname() { echo Linux; }
+        has_tty() { return 0; }
+        read_tty() { fake_read_choice "$@"; }
+        UPDATE_CHOICE=2
+        detect_install_mode
+        [[ "$IS_UPDATE_MODE" == "false" ]]
+    )
+}
+check "detect: binaries only + choice 2 → full install" run_detect_binaries_only_choose_install_test
+
+# --------------------------------------------------------------------------
+# run_update: binary swaps + restart matrix
+# --------------------------------------------------------------------------
+echo ""
+echo "============================================"
+echo "  run_update tests"
+echo "============================================"
+
+reset_update_env() {
+    rm -rf "$INSTALL_TEST_DIR" "$MONETARIUM_HOME" "$TEST_TMP/systemd" "$TEST_TMP/runhome"
+    mkdir -p "$INSTALL_TEST_DIR" "$MONETARIUM_HOME" "$TEST_TMP/systemd" "$TEST_TMP/runhome"
+    INSTALL_DIR="$INSTALL_TEST_DIR"
+    SYSTEMD_UNIT_DIR="$TEST_TMP/systemd"
+    RUN_HOME="$TEST_TMP/runhome"
+    IS_UPDATE_MODE=true
+    NODE_REPLACED=false
+    WALLET_REPLACED=false
+    BINARIES_REPLACED=false
+    : > "$SYSTEMCTL_LOG"
+    : > "$LAUNCHCTL_LOG"
+    rm -f "$MOCK_STATE/downloads.log"
+}
+
+seed_installed() {  # $1 = blob for all three binaries
+    local b
+    for b in monetarium-node monetarium-wallet monetarium-ctl; do
+        cp "$1" "$INSTALL_DIR/$b"
+        chmod +x "$INSTALL_DIR/$b"
+    done
+}
+
+publish_all() {  # $1 node blob, $2 wallet blob, $3 ctl blob
+    json_for "monetarium-node"   "$1"
+    json_for "monetarium-wallet" "$2"
+    json_for "monetarium-ctl"    "$3"
+}
+
+run_update_nothing_changed_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        local out rc
+        out="$(run_update "linux-amd64" 2>&1)"; rc=$?
+        [[ $rc -eq 0 ]] \
+            && echo "$out" | grep -q "already current" \
+            && ! grep -q "restart" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: everything current → no restart, exit 0" run_update_nothing_changed_test
+
+run_update_node_changed_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        run_update "linux-amd64" >/dev/null 2>&1
+        cmp -s "$INSTALL_DIR/monetarium-node" "$MOCK_STATE/blob-v2" \
+            && cmp -s "$INSTALL_DIR/monetarium-wallet" "$MOCK_STATE/blob-v1" \
+            && grep -q "restart monetarium-node" "$SYSTEMCTL_LOG" \
+            && ! grep -q "restart monetarium-wallet" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: node changed → node replaced + restarted, wallet untouched" run_update_node_changed_test
+
+run_update_wallet_changed_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v1"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        run_update "linux-amd64" >/dev/null 2>&1
+        grep -q "restart monetarium-wallet" "$SYSTEMCTL_LOG" \
+            && ! grep -q "restart monetarium-node" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: wallet changed → wallet restarted, node not" run_update_wallet_changed_test
+
+run_update_both_changed_order_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        run_update "linux-amd64" >/dev/null 2>&1
+        local node_line wallet_line
+        node_line="$(grep -n "restart monetarium-node" "$SYSTEMCTL_LOG" | cut -d: -f1 | head -n1)"
+        wallet_line="$(grep -n "restart monetarium-wallet" "$SYSTEMCTL_LOG" | cut -d: -f1 | head -n1)"
+        [[ -n "$node_line" && -n "$wallet_line" && "$node_line" -lt "$wallet_line" ]]
+    )
+}
+check "update: both changed → node restarted before wallet" run_update_both_changed_order_test
+
+run_update_stopped_service_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=1 WALLET_ACTIVE=1   # 1 = inactive in the mock
+        run_update "linux-amd64" >/dev/null 2>&1
+        cmp -s "$INSTALL_DIR/monetarium-node" "$MOCK_STATE/blob-v2" \
+            && ! grep -q "restart" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: service stopped before update → binary replaced, not started" run_update_stopped_service_test
+
+run_update_stale_process_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=1   # wallet inactive: only node considered
+        # Current on disk, but the process predates the binary on disk.
+        service_main_pid() { echo 4242; }
+        process_start_epoch() { echo 1000; }
+        file_mtime() { echo 2000; }
+        run_update "linux-amd64" >/dev/null 2>&1
+        grep -q "restart monetarium-node" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: stale process on current binary → restarted" run_update_stale_process_test
+
+run_service_runs_current_binary_test() {
+    (
+        set +e
+        service_main_pid() { echo 4242; }
+        printf 'bin\n' > "$TEST_TMP/runsbin"
+        process_start_epoch() { echo 2000; }
+        file_mtime() { echo 1000; }
+        service_runs_current_binary monetarium-node "$TEST_TMP/runsbin" || return 1
+        process_start_epoch() { echo 1000; }
+        file_mtime() { echo 2000; }
+        ! service_runs_current_binary monetarium-node "$TEST_TMP/runsbin"
+    )
+}
+check "service_runs_current_binary: compares process start vs binary mtime" run_service_runs_current_binary_test
+
+run_update_preserves_state_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        make_configs
+        make_wallet_db
+        make_service_unit
+        local unit="$SYSTEMD_UNIT_DIR/monetarium-node.service"
+        local node_conf_hash wallet_conf_hash db_hash unit_hash
+        node_conf_hash="$(digest_of "$NODE_CONF")"
+        wallet_conf_hash="$(digest_of "$WALLET_CONF")"
+        db_hash="$(digest_of "$(wallet_data_dir)/mainnet/wallet.db")"
+        unit_hash="$(digest_of "$unit")"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        run_update "linux-amd64" >/dev/null 2>&1
+        [[ "$(digest_of "$NODE_CONF")" == "$node_conf_hash" ]] \
+            && [[ "$(digest_of "$WALLET_CONF")" == "$wallet_conf_hash" ]] \
+            && [[ "$(digest_of "$(wallet_data_dir)/mainnet/wallet.db")" == "$db_hash" ]] \
+            && [[ "$(digest_of "$unit")" == "$unit_hash" ]] \
+            && cmp -s "$INSTALL_DIR/monetarium-node" "$MOCK_STATE/blob-v2"
+    )
+}
+check "update: configs, wallet DB and service unit byte-identical afterwards" run_update_preserves_state_test
+
+run_update_never_installs_or_configures_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2"
+        local called="$TEST_TMP/called.log"
+        rm -f "$called"
+        local fn
+        for fn in prompt_passphrase prompt_mining prompt_ticket_buyer write_configs \
+                  create_wallet configure_mining_and_voting install_systemd_service \
+                  install_launchd_service write_manifest print_warning check_selinux; do
+            eval "${fn}() { echo '${fn}' >> \"\$called\"; }"
+        done
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        run_update "linux-amd64" >/dev/null 2>&1
+        [[ ! -s "$called" ]]
+    )
+}
+check "update: never prompts, writes configs, wallet, units or manifest" run_update_never_installs_or_configures_test
+
+run_update_aborts_before_install_test() {
+    (
+        set +e
+        reset_update_env
+        seed_installed "$MOCK_STATE/blob-v1"
+        publish_all "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2" "$MOCK_STATE/blob-v2"
+        uname() { echo Linux; }
+        export NODE_ACTIVE=0 WALLET_ACTIVE=0
+        export MOCK_CURL_REPO_FAIL="monetarium-wallet"
+        local out rc
+        out="$(run_update "linux-amd64" 2>&1)"; rc=$?
+        unset MOCK_CURL_REPO_FAIL
+        # node was staged first, but the wallet failure aborted before any swap.
+        [[ $rc -ne 0 ]] \
+            && echo "$out" | grep -q "Could not reach GitHub" \
+            && cmp -s "$INSTALL_DIR/monetarium-node" "$MOCK_STATE/blob-v1" \
+            && ! grep -q "restart" "$SYSTEMCTL_LOG"
+    )
+}
+check "update: one repo unreachable → abort, nothing installed or restarted" run_update_aborts_before_install_test
+
+run_update_unreachable_api_test() {
+    (
+        set +e
+        reset_download
+        json_for "monetarium-node" "$MOCK_STATE/blob-v1"
+        PATH="$MOCK_BIN:$PATH" download_binary "monetarium-node" "monetarium-node" "linux-amd64"
+        IS_UPDATE_MODE=true
+        export MOCK_CURL_API_FAIL=1
+        local out rc
+        out="$(PATH="$MOCK_BIN:$PATH" download_binary "monetarium-node" "monetarium-node" "linux-amd64" 2>&1)"; rc=$?
+        unset MOCK_CURL_API_FAIL
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Aborting the update"
+    )
+}
+check "update: GitHub unreachable → exits with error (does not silently skip)" run_update_unreachable_api_test
+
+run_install_staged_binaries_test() {
+    (
+        set +e
+        rm -rf "$TEST_TMP/stage"
+        mkdir -p "$TEST_TMP/stage"
+        printf '#!/usr/bin/env bash\necho staged\n' > "$TEST_TMP/stage/monetarium-node"
+        chmod +x "$TEST_TMP/stage/monetarium-node"
+        STAGING_DIR="$TEST_TMP/stage"
+        INSTALL_DIR="$INSTALL_TEST_DIR"
+        install_staged_binaries >/dev/null 2>&1
+        cmp -s "$INSTALL_DIR/monetarium-node" "$STAGING_DIR/monetarium-node" \
+            && [[ -z "$(find "$INSTALL_DIR" -name '.*.new.*' -print -quit)" ]]
+    )
+}
+check "install_staged_binaries: swaps atomically, no temp file left" run_install_staged_binaries_test
+
+run_install_staged_binaries_smoke_fail_test() {
+    (
+        set +e
+        reset_update_env
+        printf '#!/usr/bin/env bash\necho old\n' > "$INSTALL_DIR/monetarium-node"
+        chmod +x "$INSTALL_DIR/monetarium-node"
+        rm -rf "$TEST_TMP/stage"
+        mkdir -p "$TEST_TMP/stage"
+        printf '#!/usr/bin/env bash\nexit 1\n' > "$TEST_TMP/stage/monetarium-node"
+        chmod +x "$TEST_TMP/stage/monetarium-node"
+        STAGING_DIR="$TEST_TMP/stage"
+        local out rc
+        out="$(install_staged_binaries 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] \
+            && echo "$out" | grep -q "smoke test" \
+            && grep -q "echo old" "$INSTALL_DIR/monetarium-node" \
+            && [[ -z "$(find "$INSTALL_DIR" -name '.*.new.*' -print -quit)" ]]
+    )
+}
+check "install_staged_binaries: failing --version aborts, old binary kept" run_install_staged_binaries_smoke_fail_test
+
+run_install_staged_binaries_write_fail_test() {
+    (
+        set +e
+        reset_update_env
+        printf '#!/usr/bin/env bash\necho old\n' > "$INSTALL_DIR/monetarium-node"
+        chmod +x "$INSTALL_DIR/monetarium-node"
+        rm -rf "$TEST_TMP/stage"
+        mkdir -p "$TEST_TMP/stage"
+        printf '#!/usr/bin/env bash\necho new\n' > "$TEST_TMP/stage/monetarium-node"
+        chmod +x "$TEST_TMP/stage/monetarium-node"
+        STAGING_DIR="$TEST_TMP/stage"
+        sudo() { [[ "$1" != "cp" ]] || return 1; command "$@"; }
+        local out rc
+        out="$(install_staged_binaries 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] \
+            && echo "$out" | grep -q "Could not write" \
+            && grep -q "echo old" "$INSTALL_DIR/monetarium-node" \
+            && [[ -z "$(find "$INSTALL_DIR" -name '.*.new.*' -print -quit)" ]]
+    )
+}
+check "install_staged_binaries: copy failure aborts and leaves no temp" run_install_staged_binaries_write_fail_test
+
+run_process_start_epoch_test() {
+    local now epoch
+    now="$(date +%s)"
+    epoch="$(process_start_epoch $$)"
+    [[ -n "$epoch" ]] && (( epoch <= now )) && (( epoch >= now - 300 ))
+}
+check "process_start_epoch: parses the current process start time" run_process_start_epoch_test
+
+run_home_for_user_test() {
+    local user home
+    user="$(id -un)"
+    home="$(_home_for_user "$user")"
+    [[ -n "$home" && -d "$home" ]]
+}
+check "_home_for_user: resolves an existing home directory" run_home_for_user_test
 
 # --------------------------------------------------------------------------
 # Cleanup
