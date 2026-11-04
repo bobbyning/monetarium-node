@@ -750,7 +750,11 @@ install_staged_binaries() {
         sudo mkdir -p "$INSTALL_DIR"
         if ! sudo cp "$STAGING_DIR/$bin" "$tmp" || ! sudo chmod 0755 "$tmp"; then
             local cleanup
-            for cleanup in "${copy_tmps[@]}" "$tmp"; do
+            # ${arr[@]+...} guard: macOS ships bash 3.2, where expanding an
+            # empty array under `set -u` is an unbound-variable error. Without
+            # it the first binary's failure dies with a confusing message
+            # instead of the real one.
+            for cleanup in ${copy_tmps[@]+"${copy_tmps[@]}"} "$tmp"; do
                 sudo rm -f "$cleanup"
             done
             die "Could not write ${bin} into ${INSTALL_DIR}. Nothing was changed."
@@ -759,7 +763,7 @@ install_staged_binaries() {
         copy_tmps+=("$tmp")
         if ! "$tmp" --version >/dev/null 2>&1; then
             local cleanup
-            for cleanup in "${copy_tmps[@]}"; do
+            for cleanup in ${copy_tmps[@]+"${copy_tmps[@]}"}; do
                 sudo rm -f "$cleanup"
             done
             die "Downloaded ${bin} failed its --version smoke test. Refusing to install it; nothing was changed."
