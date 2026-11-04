@@ -68,11 +68,21 @@ LAUNCHCTL_LOG="$TEST_TMP/launchctl.log"
 # --------------------------------------------------------------------------
 check() {
     local desc="$1"; shift
-    if "$@" >/dev/null 2>&1; then
+    local out rc
+    # Capture instead of discarding: a bare "FAIL" with no output is
+    # undebuggable from a CI log, which is exactly what platform-specific
+    # failures need.
+    out="$("$@" 2>&1)"; rc=$?
+    if [[ $rc -eq 0 ]]; then
         echo "  PASS  $desc"
         PASS=$((PASS + 1))
     else
         echo "  FAIL  $desc"
+        if [[ -n "$out" ]]; then
+            printf '%s\n' "$out" | sed 's/^/        /'
+        else
+            echo "        (no output; exit $rc)"
+        fi
         FAIL=$((FAIL + 1))
     fi
 }
@@ -1225,8 +1235,11 @@ run_detect_service_and_wallet_no_configs_test() {
         set +e
         reset_detect_env
         make_service_unit
-        make_wallet_db
+        # Pin the platform BEFORE creating the wallet DB: wallet_data_dir()
+        # calls uname, so on macOS the DB would land in a different path than
+        # the one detect_install_mode() later checks.
         uname() { echo Linux; }
+        make_wallet_db
         has_tty() { return 1; }
         local out rc
         out="$(detect_install_mode 2>&1)"; rc=$?
@@ -1410,6 +1423,9 @@ run_update_stale_process_test() {
         reset_update_env
         seed_installed "$MOCK_STATE/blob-v1"
         publish_all "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1" "$MOCK_STATE/blob-v1"
+        # Pin the platform BEFORE run_update: it calls service_is_active, which
+        # branches on uname. On macOS the launchctl branch would be taken and
+        # the restart would never reach the systemctl log.
         uname() { echo Linux; }
         export NODE_ACTIVE=0 WALLET_ACTIVE=1   # wallet inactive: only node considered
         # Current on disk, but the process predates the binary on disk.
@@ -1443,6 +1459,9 @@ run_update_preserves_state_test() {
         reset_update_env
         seed_installed "$MOCK_STATE/blob-v1"
         make_configs
+        # Pin the platform before creating the wallet DB: wallet_data_dir()
+        # calls uname, so the DB must land where run_update() looks for it.
+        uname() { echo Linux; }
         make_wallet_db
         make_service_unit
         local unit="$SYSTEMD_UNIT_DIR/monetarium-node.service"
@@ -1571,6 +1590,8 @@ run_install_staged_binaries_write_fail_test() {
         printf '#!/usr/bin/env bash\necho new\n' > "$TEST_TMP/stage/monetarium-node"
         chmod +x "$TEST_TMP/stage/monetarium-node"
         STAGING_DIR="$TEST_TMP/stage"
+        # Fail only the copy. This is a function-level failure, so it works
+        # whether the suite runs as a normal user or as root.
         sudo() { [[ "$1" != "cp" ]] || return 1; command "$@"; }
         local out rc
         out="$(install_staged_binaries 2>&1)"; rc=$?
