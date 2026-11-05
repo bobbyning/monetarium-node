@@ -206,6 +206,16 @@ chmod +x "$MOCK_BIN/systemctl"
 cat > "$MOCK_BIN/launchctl" <<'MOCKEOF'
 #!/usr/bin/env bash
 { echo "launchctl $*" >> "$LAUNCHCTL_LOG"; } 2>/dev/null || true
+# `launchctl print` exits 0 for any LOADED job, running or not, and reports
+# liveness only through the `state` line. Mirror that: LAUNCHD_STATE selects
+# the state (default running), LAUNCHD_LOADED=0 makes the job unknown.
+if [[ "${1:-}" == "print" ]]; then
+    [[ "${LAUNCHD_LOADED:-1}" == "1" ]] || exit 113
+    echo "gui/501/com.monetarium.node = {"
+    echo "	state = ${LAUNCHD_STATE:-running}"
+    echo "}"
+    exit 0
+fi
 exit 0
 MOCKEOF
 chmod +x "$MOCK_BIN/launchctl"
@@ -861,6 +871,60 @@ run_restart_darwin_only_changed_test() {
 }
 check "Darwin → only replaced binary's service kickstarted" run_restart_darwin_only_changed_test
 
+run_service_is_active_darwin_test() {
+    (
+        set +e
+        export LAUNCHCTL_LOG
+        uname() { echo Darwin; }
+        export -f uname
+        LAUNCHD_STATE=running service_is_active monetarium-node || return 1
+        # Loaded but not running: `launchctl print` still exits 0, so the exit
+        # status alone would wrongly report the service as up.
+        LAUNCHD_STATE="not running" service_is_active monetarium-node && return 1
+        LAUNCHD_LOADED=0 service_is_active monetarium-node && return 1
+        return 0
+    )
+}
+check "Darwin: service_is_active reads the job state, not the exit code" run_service_is_active_darwin_test
+
+run_wait_service_active_dies_test() {
+    (
+        set +e
+        export LAUNCHCTL_LOG
+        uname() { echo Darwin; }
+        export -f uname
+        SERVICE_SETTLE_SECS=2
+        # Up at the first poll, then dies: the settle window must catch it.
+        local calls=0
+        service_is_active() {
+            calls=$((calls + 1))
+            (( calls <= 1 ))
+        }
+        ! wait_service_active monetarium-node
+    )
+}
+check "wait_service_active: a service that dies after starting is a failure" run_wait_service_active_dies_test
+
+run_wait_service_active_stays_up_test() {
+    (
+        set +e
+        SERVICE_SETTLE_SECS=2
+        service_is_active() { return 0; }
+        wait_service_active monetarium-node
+    )
+}
+check "wait_service_active: a service that stays up succeeds" run_wait_service_active_stays_up_test
+
+run_wait_service_active_never_starts_test() {
+    (
+        set +e
+        SERVICE_SETTLE_SECS=1
+        service_is_active() { return 1; }
+        ! wait_service_active monetarium-node
+    )
+}
+check "wait_service_active: a service that never starts fails" run_wait_service_active_never_starts_test
+
 # --------------------------------------------------------------------------
 # generate/miningaddr guard tests (configure_mining_and_voting)
 # --------------------------------------------------------------------------
@@ -1224,11 +1288,87 @@ run_detect_unit_only_test() {
         make_service_unit
         uname() { echo Linux; }
         has_tty() { return 1; }
-        detect_install_mode
-        [[ "$IS_UPDATE_MODE" == "false" ]]
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        # A unit without configs is an existing installation, not a fresh one:
+        # a full install would rewrite the unit with the current user.
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
     )
 }
-check "detect: service unit without configs → full install" run_detect_unit_only_test
+check "detect: service unit without configs → asks (no TTY aborts)" run_detect_unit_only_test
+
+run_detect_node_conf_only_test() {
+    (
+        set +e
+        reset_detect_env
+        printf 'node-conf\n' > "$NODE_CONF"
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        # A lone node config must never be silently reinstalled: write_configs
+        # would rewrite it and drop hand-edited settings.
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: node config only → asks (no TTY aborts)" run_detect_node_conf_only_test
+
+run_detect_node_conf_and_unit_test() {
+    (
+        set +e
+        reset_detect_env
+        printf 'node-conf\n' > "$NODE_CONF"
+        make_service_unit
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: node config + unit, wallet config missing → asks" run_detect_node_conf_and_unit_test
+
+run_detect_wallet_conf_only_test() {
+    (
+        set +e
+        reset_detect_env
+        printf 'wallet-conf\n' > "$WALLET_CONF"
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: wallet config only → asks (no TTY aborts)" run_detect_wallet_conf_only_test
+
+run_detect_manifest_only_test() {
+    (
+        set +e
+        reset_detect_env
+        printf 'manifest\n' > "$MANIFEST"
+        uname() { echo Linux; }
+        has_tty() { return 1; }
+        local out rc
+        out="$(detect_install_mode 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "Cannot choose between install and update"
+    )
+}
+check "detect: manifest only → asks (no TTY aborts)" run_detect_manifest_only_test
+
+run_install_refuses_sudo_test() {
+    (
+        set +e
+        # Simulate a sudo invocation: the runtime user differs from the
+        # invoking one. A fresh install must refuse rather than create the
+        # data directory as root inside the user's home.
+        RUN_USER="someone-else"
+        local out rc
+        out="$(run_install "linux-amd64" 2>&1)"; rc=$?
+        [[ $rc -ne 0 ]] && echo "$out" | grep -q "without sudo"
+    )
+}
+check "install: a fresh install through sudo is refused" run_install_refuses_sudo_test
 
 run_detect_service_and_wallet_no_configs_test() {
     (

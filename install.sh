@@ -581,13 +581,16 @@ service_target() {
 }
 
 # service_is_active reports whether the service is running right now.
+# On macOS `launchctl print` exits 0 for any LOADED job, running or not, so its
+# exit status says nothing about liveness: the job's `state` line must be read.
 service_is_active() {
     local svc="$1" label
     case "$(uname -s)" in
         Linux)  systemctl is-active --quiet "$svc" 2>/dev/null ;;
         Darwin)
             label="$(service_target "$svc")" || return 1
-            launchctl print "gui/${RUN_UID}/${label}" >/dev/null 2>&1
+            launchctl print "gui/${RUN_UID}/${label}" 2>/dev/null \
+                | grep -Eq '^[[:space:]]*state = running$'
             ;;
     esac
 }
@@ -664,15 +667,30 @@ restart_service() {
     esac
 }
 
-# wait_service_active polls for up to 20 seconds until the service is active.
+# wait_service_active polls until the service is active, then keeps watching
+# for a settle period. A unit with Type=simple is "active" the moment the
+# process starts, and Restart=on-failure brings it back to "active" between
+# crashes, so a single check would report success for a node that dies a
+# second later. The settle window is longer than RestartSec (5s) so a crash
+# loop is caught instead of being mistaken for a healthy start.
+SERVICE_SETTLE_SECS="${SERVICE_SETTLE_SECS:-8}"
+
 wait_service_active() {
     local svc="$1" i=0
     while (( i < 20 )); do
-        service_is_active "$svc" && return 0
+        service_is_active "$svc" && break
         sleep 1
         i=$((i + 1))
     done
-    return 1
+    service_is_active "$svc" || return 1
+
+    i=0
+    while (( i < SERVICE_SETTLE_SECS )); do
+        sleep 1
+        service_is_active "$svc" || return 1
+        i=$((i + 1))
+    done
+    return 0
 }
 
 # Platform-appropriate command for the user to inspect a failed service.
@@ -701,38 +719,47 @@ prompt_install_or_update() {
     esac
 }
 
-# Sets IS_UPDATE_MODE. The only ambiguous cases are a partial installation
-# with no usable config set, and binaries without configs or services; both
-# ask. A service unit without configs is a broken install and falls back to
-# the full installer (answer to "unit present, configs missing").
+# Sets IS_UPDATE_MODE. A fresh install is chosen ONLY when nothing at all is
+# on disk: no node config, no wallet config, no service unit, no binaries, no
+# wallet database and no manifest. Anything else is an existing installation
+# and must never be silently reinstalled: a full install rewrites the configs
+# (dropping hand-edited settings such as proxy= and addpeer=) and rewrites the
+# service units with the current user, which can move the service to another
+# account.
+#
+# A complete config set is an update. Every other partial state asks, and the
+# question fails without a terminal, so a non-interactive run never guesses.
 detect_install_mode() {
-    local bins confs=false db=false svc=false manifest=false
+    local bins confs=false node_conf=false wallet_conf=false
+    local db=false svc=false manifest=false
     bins="$(installed_binary_count)"
-    [[ -f "$NODE_CONF" && -f "$WALLET_CONF" ]] && confs=true
+    [[ -f "$NODE_CONF" ]] && node_conf=true
+    [[ -f "$WALLET_CONF" ]] && wallet_conf=true
+    $node_conf && $wallet_conf && confs=true
     [[ -f "$(wallet_data_dir)/mainnet/wallet.db" ]] && db=true
     service_installed && svc=true
     [[ -f "$MANIFEST" ]] && manifest=true
-
-    if $svc && ! $confs; then
-        if $db; then
-            prompt_install_or_update "Existing services and a wallet database found, but no config files."
-        else
-            IS_UPDATE_MODE=false
-        fi
-        return
-    fi
 
     if $confs; then
         IS_UPDATE_MODE=true
         return
     fi
 
-    if [[ "$bins" -eq 0 ]] && ! $db && ! $manifest; then
+    if ! $node_conf && ! $wallet_conf && ! $svc && ! $db && ! $manifest \
+        && [[ "$bins" -eq 0 ]]; then
         IS_UPDATE_MODE=false
         return
     fi
 
-    prompt_install_or_update "Existing monetarium binaries or wallet data found, but no config files or services."
+    if $node_conf && ! $wallet_conf; then
+        prompt_install_or_update "A node config exists but the wallet config is missing."
+    elif $wallet_conf && ! $node_conf; then
+        prompt_install_or_update "A wallet config exists but the node config is missing."
+    elif $svc; then
+        prompt_install_or_update "Existing service units found, but no config files."
+    else
+        prompt_install_or_update "Existing monetarium binaries or wallet data found, but no config files or services."
+    fi
 }
 
 # Copy every staged binary next to its final path, smoke-test the copies and
@@ -857,9 +884,7 @@ run_update() {
         return 1
     fi
 
-    if $node_changed || $wallet_changed || $ctl_changed; then
-        green "Update complete."
-    fi
+    green "Update complete."
     return 0
 }
 
@@ -1652,6 +1677,14 @@ print_warning() {
 # --------------------------------------------------------------------------
 run_install() {
     local platform="$1"
+
+    # A fresh install must run as the account that will own the node. Under
+    # sudo the data directory would be created by root inside the user's home
+    # (mode 700, so the service user cannot enter it) and the wallet would be
+    # created under root's HOME while the check looks in the user's.
+    if [[ "$RUN_USER" != "$(id -un)" ]]; then
+        die "Run a fresh install without sudo, as the account that will own the node."
+    fi
 
     check_selinux
 

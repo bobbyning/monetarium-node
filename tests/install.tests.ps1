@@ -342,10 +342,34 @@ Describe 'install.ps1' {
             Get-InstallMode | Should -Be 'Update'
         }
 
-        It 'falls back to a full install when startup scripts exist without configs' {
+        It 'asks when startup scripts exist without configs' {
             New-Item -ItemType Directory -Path $Script:StartupDir -Force | Out-Null
             Set-Content -Path (Join-Path $Script:StartupDir 'MonetariumNode.vbs') -Value 'x'
+            Get-InstallMode | Should -Be 'Update'
+            Should -Invoke Read-Host -Times 1 -Exactly
+        }
+
+        It 'asks when only the node config exists' {
+            Mock Read-Host { '2' }
+            New-Item -ItemType Directory -Path $Script:DataDir -Force | Out-Null
+            Set-Content -Path $Script:NodeConf -Value 'rpcuser=x'
             Get-InstallMode | Should -Be 'Install'
+            Should -Invoke Read-Host -Times 1 -Exactly
+        }
+
+        It 'asks when only the wallet config exists' {
+            Mock Read-Host { '2' }
+            New-Item -ItemType Directory -Path $Script:DataDir -Force | Out-Null
+            Set-Content -Path $Script:WalletConf -Value 'username=x'
+            Get-InstallMode | Should -Be 'Install'
+            Should -Invoke Read-Host -Times 1 -Exactly
+        }
+
+        It 'asks when only the manifest exists' {
+            New-Item -ItemType Directory -Path $Script:DataDir -Force | Out-Null
+            Set-Content -Path $Script:Manifest -Value 'x'
+            Get-InstallMode | Should -Be 'Update'
+            Should -Invoke Read-Host -Times 1 -Exactly
         }
 
         It 'asks when startup scripts and a wallet database exist without configs' {
@@ -508,6 +532,29 @@ Describe 'install.ps1' {
             Mock Request-GracefulStop { }
             { Main } | Should -Throw '*Could not stop monetarium-node*'
             (Get-Content -Path (Join-Path $Script:InstallDir 'monetarium-node.exe') -Raw) | Should -Match 'old monetarium-node'
+        }
+
+        It 'restarts what it stopped when the swap fails' {
+            $script:RunningProcesses['monetarium-node'] = New-FakeProcess
+            Mock Install-StagedBinary { throw 'antivirus is holding the file' }
+            # The process is gone once stopped, so the finally block must see
+            # it as not running and start it again.
+            # The process is gone once stopped, so the finally block must see
+            # it as not running and start it again.
+            Mock Get-MonetariumProcess {
+                param($BinaryName)
+                if ($script:StopRequests -contains $BinaryName) { return $null }
+                if ($script:RunningProcesses.ContainsKey($BinaryName)) { return $script:RunningProcesses[$BinaryName] }
+                return $null
+            }
+            # The swap throws before the normal restart, so the finally block
+            # is the only thing that can bring the node back.
+            Mock Start-MonetariumProcess {
+                param($BinaryName)
+                $script:StartedProcesses += $BinaryName
+            }
+            { Main } | Should -Throw '*antivirus*'
+            $script:StartedProcesses | Should -Contain 'monetarium-node'
         }
 
         It 'fails loudly when a restarted process exits immediately' {

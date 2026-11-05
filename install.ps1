@@ -88,7 +88,9 @@ $Script:RpcSecret = $null
 # Update mode: staging directory for verified downloads, and the timings used
 # when stopping/starting processes (tests set these to 0 to stay fast).
 $Script:StagingDir              = $null
-$Script:ServiceStopTimeoutSecs  = 20
+# Matches systemd's default TimeoutStopSec: a node on a slow disk needs more
+# than a few seconds to flush before it is killed.
+$Script:ServiceStopTimeoutSecs  = 90
 $Script:ServiceStartGraceSecs   = 2
 
 # --------------------------------------------------------------------------
@@ -284,11 +286,12 @@ function Read-InstallModeChoice {
 }
 
 function Get-InstallMode {
-    # Returns 'Install' or 'Update'. Only genuinely ambiguous leftovers ask;
-    # a configured node is always an update, and nothing at all is always a
-    # fresh install. A startup script without configs is a broken install and
-    # falls back to the full installer unless a wallet database says otherwise.
-    $configs = (Test-Path -LiteralPath $Script:NodeConf) -and (Test-Path -LiteralPath $Script:WalletConf)
+    # Returns 'Install' or 'Update'. A fresh install is chosen ONLY when
+    # nothing at all is on disk; anything else is an existing installation and
+    # asks, because a full install rewrites the configs and startup scripts.
+    $nodeConf = Test-Path -LiteralPath $Script:NodeConf
+    $walletConf = Test-Path -LiteralPath $Script:WalletConf
+    $configs = $nodeConf -and $walletConf
 
     $knownBinaries = @('monetarium-node', 'monetarium-wallet', 'monetarium-ctl')
     $installedCount = 0
@@ -301,15 +304,25 @@ function Get-InstallMode {
     $walletDb = Test-Path -LiteralPath (Join-Path (Get-WalletDataDir) 'mainnet\wallet.db')
     $manifest = Test-Path -LiteralPath $Script:Manifest
 
-    if ($startupScripts -and -not $configs) {
-        if ($walletDb) {
-            return Read-InstallModeChoice -Reason 'Existing startup scripts and a wallet database found, but no config files.'
-        }
+    if ($configs) { return 'Update' }
+
+    # A fresh install is chosen ONLY when nothing at all is on disk. Anything
+    # else is an existing installation: a full install rewrites the configs
+    # and the startup scripts, which is the loss update mode exists to avoid.
+    if (-not $nodeConf -and -not $walletConf -and -not $startupScripts -and
+        $installedCount -eq 0 -and -not $walletDb -and -not $manifest) {
         return 'Install'
     }
-    if ($configs) { return 'Update' }
-    if ($installedCount -eq 0 -and -not $walletDb -and -not $manifest) { return 'Install' }
 
+    if ($nodeConf -and -not $walletConf) {
+        return Read-InstallModeChoice -Reason 'A node config exists but the wallet config is missing.'
+    }
+    if ($walletConf -and -not $nodeConf) {
+        return Read-InstallModeChoice -Reason 'A wallet config exists but the node config is missing.'
+    }
+    if ($startupScripts) {
+        return Read-InstallModeChoice -Reason 'Existing startup scripts found, but no config files.'
+    }
     return Read-InstallModeChoice -Reason 'Existing Monetarium binaries or wallet data found, but no config files or startup scripts.'
 }
 
@@ -497,6 +510,7 @@ function Invoke-Update {
     Write-Info 'Existing installation detected - updating binaries only.'
     Write-Info 'Configs, wallet, startup scripts and settings are left untouched.'
 
+    $stopped = @()
     $Script:StagingDir = Join-Path $env:TEMP ("monetarium-update-" + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $Script:StagingDir -Force | Out-Null
     try {
@@ -546,8 +560,14 @@ function Invoke-Update {
 
         # Stop the wallet before the node; restart the node before the wallet
         # so the wallet finds its RPC endpoint on the way up.
-        if ($restartWallet) { $null = Stop-MonetariumProcess -BinaryName 'monetarium-wallet' }
-        if ($restartNode) { $null = Stop-MonetariumProcess -BinaryName 'monetarium-node' }
+        if ($restartWallet) {
+            $null = Stop-MonetariumProcess -BinaryName 'monetarium-wallet'
+            $stopped += 'monetarium-wallet'
+        }
+        if ($restartNode) {
+            $null = Stop-MonetariumProcess -BinaryName 'monetarium-node'
+            $stopped += 'monetarium-node'
+        }
 
         foreach ($name in $changed) {
             Install-StagedBinary -BinaryName $name -StagedPath $staged[$name]
@@ -560,6 +580,17 @@ function Invoke-Update {
             Write-Info "Replaced: $($changed -join ', ')"
         }
     } finally {
+        # Whatever this run stopped must be running again when it exits, even
+        # if the swap or a start threw. Otherwise a failed update leaves the
+        # node down, and the next run sees it stopped and never starts it.
+        foreach ($name in $stopped) {
+            if (Get-MonetariumProcess -BinaryName $name) { continue }
+            try {
+                Start-MonetariumProcess -BinaryName $name
+            } catch {
+                Write-Warn "$name is not running and could not be restarted: $($_.Exception.Message)"
+            }
+        }
         if ($Script:StagingDir -and (Test-Path -LiteralPath $Script:StagingDir)) {
             Remove-Item -LiteralPath $Script:StagingDir -Recurse -Force -ErrorAction SilentlyContinue
         }
