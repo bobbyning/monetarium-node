@@ -108,7 +108,68 @@ Pre-built binaries for Linux, macOS, and Windows. Choose your platform:
 
 The script downloads the latest release binaries, creates configs, and sets up the
 node daemon + wallet. On Linux/macOS it creates a systemd service; on Windows it
-creates a scheduled task.
+writes `.vbs` launchers into your Startup folder.
+
+### Updating an existing node (Linux / macOS)
+
+Re-run the same install command on a machine where Monetarium is already
+installed and the script switches to **update mode** automatically. No flags are
+needed. Update mode only:
+
+1. Downloads the latest official release binaries.
+2. Replaces `/usr/local/bin/monetarium-{node,wallet,ctl}` — and only those whose
+   published checksum differs from the installed binary. Binaries installed
+   anywhere else (for example `~/bin`, or a unit pointing at another path) are
+   **not** updated; the service keeps running the old binary.
+3. Restarts a service only if its binary changed **and** it was running before
+   the update. A service you stopped stays stopped. The wallet unit has
+   `Requires=monetarium-node.service`, so restarting the node also restarts the
+   wallet.
+
+It never touches your config files, wallet database, service units,
+`install.manifest`, mining/voting settings, and it never asks for the wallet
+passphrase. Run it as your normal user, or with `sudo` (the real user is then
+detected via `SUDO_USER`). A **fresh install** should be run as the account that
+will own the node, not via `sudo`.
+
+If the download or checksum verification of any binary fails, the update aborts
+before anything is replaced. There is no automatic rollback: if a service fails
+to come back up, the script exits non-zero so you can inspect the logs
+(`journalctl -u monetarium-node -n 50` on Linux, `launchctl print
+gui/$(id -u)/com.monetarium.node` on macOS). A restart only counts as
+successful if the service is still running several seconds later, so a node
+that crashes on startup is reported as a failure rather than a success.
+
+A re-run cannot re-trigger the setup wizard. To reconfigure from scratch, remove
+the configs under `~/.monetarium` and re-run; with no configs, service units,
+binaries, wallet database or manifest left, the script treats it as a fresh
+install.
+
+If the script finds any part of an existing installation but not a complete
+config set — a lone node or wallet config, service units without configs, or
+binaries without configs — it asks whether to update the binaries or run a full
+install. In a non-interactive context (cron, CI) it exits with an error instead
+of guessing.
+
+### Updating an existing node (Windows)
+
+Re-run the same PowerShell command on a machine where Monetarium is already
+installed and `install.ps1` switches to **update mode** automatically. It
+downloads and verifies the release binaries, then replaces only the ones whose
+published checksum differs. It never prompts and never touches your configs, the
+wallet, the Startup scripts or `install.manifest`.
+
+Windows will not let a running `.exe` be replaced, so update mode stops the
+affected process first — gracefully through `monetarium-ctl stop` (or
+`monetarium-ctl --wallet stop`), and only falls back to a forced termination,
+with a warning, if that does not take. A process that was not running before the
+update is never started. The node is restarted before the wallet.
+
+If GitHub is unreachable, a checksum does not match, or a downloaded binary fails
+its `--version` check, the update aborts before anything is replaced and exits
+non-zero. There is no automatic rollback. Anything this run stopped is started
+again before it exits, so a failed swap does not leave the node down. Binaries
+outside the install directory are not updated.
 
 For a detailed walkthrough — what gets installed, how to verify the node, wallet
 and balance, checking logs, troubleshooting, and uninstalling — see

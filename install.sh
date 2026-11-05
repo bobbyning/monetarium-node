@@ -17,6 +17,49 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------
+# Runtime user
+# --------------------------------------------------------------------------
+# This script normally runs as the target user and calls sudo for the steps
+# that need root. When it IS run through sudo, $HOME points at root, so every
+# path below would resolve under /root: detection would miss the real install
+# and create a second one. Resolve the invoking user instead.
+_home_for_user() {
+    local user="$1"
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd "$user" | cut -d: -f6
+        return
+    fi
+    if command -v dscl >/dev/null 2>&1; then
+        dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}'
+        return
+    fi
+    return 1
+}
+
+# resolve_runtime_user sets RUN_USER, RUN_UID, RUN_GID and RUN_HOME for the
+# user who invoked the script, preferring SUDO_USER when run through sudo.
+resolve_runtime_user() {
+    RUN_USER="$(id -un)"
+    RUN_UID="$(id -u)"
+    RUN_GID="$(id -g)"
+    RUN_HOME="${HOME:-}"
+    if [[ "$RUN_UID" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        local home uid gid
+        home="$(_home_for_user "$SUDO_USER" || true)"
+        uid="$(id -u "$SUDO_USER" 2>/dev/null || true)"
+        gid="$(id -g "$SUDO_USER" 2>/dev/null || true)"
+        if [[ -n "$home" && -d "$home" && -n "$uid" && "$uid" != "0" ]]; then
+            RUN_USER="$SUDO_USER"
+            RUN_UID="$uid"
+            RUN_GID="$gid"
+            RUN_HOME="$home"
+        fi
+    fi
+}
+
+resolve_runtime_user
+
+# --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 GITHUB_ORG="monetarium"
@@ -26,12 +69,16 @@ REPO_CTL="monetarium-ctl"
 
 INSTALL_DIR="/usr/local/bin"
 
+# Overridable so the unit tests can point service detection at a temp tree.
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+LAUNCHD_DIR="${LAUNCHD_DIR:-${RUN_HOME}/Library/LaunchAgents}"
+
 detect_data_dir() {
     if [[ -n "${MONETARIUM_HOME:-}" ]]; then
         echo "$MONETARIUM_HOME"
         return
     fi
-    local home="$HOME"
+    local home="$RUN_HOME"
     case "$(uname -s)" in
         Darwin) echo "${home}/Library/Application Support/Monetarium" ;;
         *)      echo "${home}/.monetarium" ;;
@@ -51,7 +98,7 @@ detect_ctl_data_dir() {
         echo "$MONETARIUM_CTL_HOME"
         return
     fi
-    local home="$HOME"
+    local home="$RUN_HOME"
     case "$(uname -s)" in
         Darwin) echo "${home}/Library/Application Support/Monetarium-ctl" ;;
         *)      echo "${home}/.monetarium-ctl" ;;
@@ -289,11 +336,14 @@ sha256_of() {
 lc() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
 
 download_binary() {
-    # $1 = repo, $2 = binary name to install, $3 = platform
+    # $1 = repo, $2 = binary name to install, $3 = platform,
+    # $4 = optional staging dir. With a staging dir the verified binary is
+    # copied there instead of installed, so callers can fetch everything
+    # before touching the live install.
     # Re-runs self-update: the asset's published sha256 is compared against
     # the installed binary, and the download is skipped when they match.
     # The downloaded file is hash-verified before it is ever installed.
-    local repo="$1" bin_name="$2" platform="$3"
+    local repo="$1" bin_name="$2" platform="$3" stage_dir="${4:-}"
     local dest="${INSTALL_DIR}/${bin_name}"
     local had_binary=false
     [[ -f "$dest" ]] && had_binary=true
@@ -309,6 +359,9 @@ download_binary() {
     fi
     if [[ $rc -ne 0 ]]; then
         # rc == 1: GitHub unreachable.
+        if $IS_UPDATE_MODE; then
+            die "Could not reach GitHub to check for ${bin_name} updates. Aborting the update; nothing was changed."
+        fi
         if $had_binary; then
             info "Skipping ${bin_name} - could not reach GitHub to check for updates (already installed)."
             return
@@ -409,6 +462,16 @@ download_binary() {
     [[ -n "$found" ]] || { rm -rf "$tmpdir"; die "Could not locate '${bin_name}' binary inside downloaded archive."; }
 
     chmod +x "$found"
+
+    if [[ -n "$stage_dir" ]]; then
+        mkdir -p "$stage_dir"
+        cp "$found" "$stage_dir/$bin_name"
+        chmod +x "$stage_dir/$bin_name"
+        rm -rf "$tmpdir"
+        info "Staged ${bin_name} for update."
+        return
+    fi
+
     sudo mkdir -p "$INSTALL_DIR"
     sudo mv "$found" "${INSTALL_DIR}/${bin_name}"
     rm -rf "$tmpdir"
@@ -453,10 +516,376 @@ restart_monetarium_services() {
                     monetarium-wallet) label="com.monetarium.wallet" ;;
                     *) continue ;;
                 esac
-                launchctl kickstart -k "gui/$(id -u)/$label" 2>/dev/null || true
+                launchctl kickstart -k "gui/${RUN_UID}/$label" 2>/dev/null || true
             done
             ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# 2c. Update mode: re-running on an existing node
+# --------------------------------------------------------------------------
+# Re-running this script on an existing installation must behave as an
+# updater, not as a reinstall. The update path only downloads the release
+# binaries, swaps them into place and restarts the services whose binary
+# changed. It never touches configs, the wallet, the service units or the
+# manifest, and it never asks for the passphrase.
+
+IS_UPDATE_MODE=false
+STAGING_DIR=""
+
+# service_unit_paths prints the service definition path for each service.
+service_unit_paths() {
+    case "$(uname -s)" in
+        Linux)
+            printf '%s\n' "$SYSTEMD_UNIT_DIR/monetarium-node.service" \
+                          "$SYSTEMD_UNIT_DIR/monetarium-wallet.service"
+            ;;
+        Darwin)
+            printf '%s\n' "$LAUNCHD_DIR/com.monetarium.node.plist" \
+                          "$LAUNCHD_DIR/com.monetarium.wallet.plist"
+            ;;
+    esac
+}
+
+# service_installed reports whether at least one service unit exists.
+service_installed() {
+    local unit
+    while IFS= read -r unit; do
+        [[ -f "$unit" ]] && return 0
+    done < <(service_unit_paths)
+    return 1
+}
+
+# installed_binary_count prints how many release binaries exist in INSTALL_DIR.
+installed_binary_count() {
+    local n=0 bin
+    for bin in monetarium-node monetarium-wallet monetarium-ctl; do
+        [[ -f "$INSTALL_DIR/$bin" ]] && n=$((n + 1))
+    done
+    printf '%s\n' "$n"
+}
+
+# Map a service/binary name to its platform-specific daemon label.
+service_target() {
+    case "$(uname -s)" in
+        Linux)  printf '%s\n' "$1" ;;
+        Darwin)
+            case "$1" in
+                monetarium-node)   echo "com.monetarium.node" ;;
+                monetarium-wallet) echo "com.monetarium.wallet" ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+}
+
+# service_is_active reports whether the service is running right now.
+# On macOS `launchctl print` exits 0 for any LOADED job, running or not, so its
+# exit status says nothing about liveness: the job's `state` line must be read.
+service_is_active() {
+    local svc="$1" label
+    case "$(uname -s)" in
+        Linux)  systemctl is-active --quiet "$svc" 2>/dev/null ;;
+        Darwin)
+            label="$(service_target "$svc")" || return 1
+            launchctl print "gui/${RUN_UID}/${label}" 2>/dev/null \
+                | grep -Eq '^[[:space:]]*state = running$'
+            ;;
+    esac
+}
+
+# service_main_pid prints the PID of the service's main process, if any.
+service_main_pid() {
+    local svc="$1"
+    case "$(uname -s)" in
+        Linux)  systemctl show -p MainPID --value "$svc" 2>/dev/null ;;
+        Darwin) pgrep -f "${INSTALL_DIR}/${svc}( |$)" 2>/dev/null | head -n1 ;;
+    esac
+}
+
+# Start time of a process as a Unix timestamp, parsed from `ps -o etime=`
+# ([dd-]hh:mm:ss or mm:ss). Both GNU and BSD ps support this format.
+process_start_epoch() {
+    local pid="$1" etime days=0 hours=0 mins=0 secs=0
+    etime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$etime" ]] || return 1
+    if [[ "$etime" == *-* ]]; then
+        days="${etime%%-*}"
+        etime="${etime#*-}"
+    fi
+    local -a parts=()
+    local IFS=':'
+    read -r -a parts <<< "$etime"
+    unset IFS
+    case "${#parts[@]}" in
+        3) hours="${parts[0]}"; mins="${parts[1]}"; secs="${parts[2]}" ;;
+        2) mins="${parts[0]}"; secs="${parts[1]}" ;;
+        1) secs="${parts[0]}" ;;
+        *) return 1 ;;
+    esac
+    [[ "$days$hours$mins$secs" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$(( $(date +%s) - (10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs) ))"
+}
+
+# file_mtime prints a file's modification time as a Unix timestamp.
+file_mtime() {
+    if stat -c %Y "$1" >/dev/null 2>&1; then
+        stat -c %Y "$1"
+    else
+        stat -f %m "$1"
+    fi
+}
+
+# True when the running process started at or after the on-disk binary was
+# written. A previous run can die after replacing the binary but before
+# restarting the service; the hash then matches and a plain "already current"
+# check would leave the old inode running forever.
+service_runs_current_binary() {
+    local svc="$1" dest="$2" pid start mtime
+    pid="$(service_main_pid "$svc")" || return 0
+    [[ -n "$pid" && "$pid" != "0" ]] || return 0
+    start="$(process_start_epoch "$pid")" || return 0
+    mtime="$(file_mtime "$dest")" || return 0
+    (( start >= mtime ))
+}
+
+# restart_service restarts one service through the platform's native tool.
+restart_service() {
+    local svc="$1" label
+    case "$(uname -s)" in
+        Linux) sudo systemctl restart "$svc" ;;
+        Darwin)
+            label="$(service_target "$svc")" || return 1
+            if launchctl print "gui/${RUN_UID}/${label}" >/dev/null 2>&1; then
+                launchctl kickstart -k "gui/${RUN_UID}/${label}"
+            else
+                launchctl unload "$LAUNCHD_DIR/${label}.plist" 2>/dev/null || true
+                launchctl load "$LAUNCHD_DIR/${label}.plist"
+            fi
+            ;;
+    esac
+}
+
+# wait_service_active polls until the service is active, then keeps watching
+# for a settle period. A unit with Type=simple is "active" the moment the
+# process starts, and Restart=on-failure brings it back to "active" between
+# crashes, so a single check would report success for a node that dies a
+# second later. The settle window is longer than RestartSec (5s) so a crash
+# loop is caught instead of being mistaken for a healthy start.
+SERVICE_SETTLE_SECS="${SERVICE_SETTLE_SECS:-8}"
+
+wait_service_active() {
+    local svc="$1" i=0
+    while (( i < 20 )); do
+        service_is_active "$svc" && break
+        sleep 1
+        i=$((i + 1))
+    done
+    service_is_active "$svc" || return 1
+
+    i=0
+    while (( i < SERVICE_SETTLE_SECS )); do
+        sleep 1
+        service_is_active "$svc" || return 1
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# Platform-appropriate command for the user to inspect a failed service.
+service_log_hint() {
+    local svc="$1" label
+    case "$(uname -s)" in
+        Linux) echo "journalctl -u ${svc} -n 50" ;;
+        Darwin)
+            label="$(service_target "$svc")" || label="$svc"
+            echo "launchctl print gui/${RUN_UID}/${label}"
+            ;;
+    esac
+}
+
+# prompt_install_or_update asks the user to pick a mode and dies without a TTY.
+prompt_install_or_update() {
+    local reason="$1" answer
+    if ! has_tty; then
+        die "${reason} Cannot choose between install and update non-interactively. Run this script from a terminal, or remove the leftover files to force a clean install."
+    fi
+    red "$reason"
+    read_tty -r -p "Install or update? [1] Update binaries only [2] Full install: " answer
+    case "$answer" in
+        2|[fF]|[fF][uU][lL][lL]*) IS_UPDATE_MODE=false ;;
+        *)                        IS_UPDATE_MODE=true ;;
+    esac
+}
+
+# Sets IS_UPDATE_MODE. A fresh install is chosen ONLY when nothing at all is
+# on disk: no node config, no wallet config, no service unit, no binaries, no
+# wallet database and no manifest. Anything else is an existing installation
+# and must never be silently reinstalled: a full install rewrites the configs
+# (dropping hand-edited settings such as proxy= and addpeer=) and rewrites the
+# service units with the current user, which can move the service to another
+# account.
+#
+# A complete config set is an update. Every other partial state asks, and the
+# question fails without a terminal, so a non-interactive run never guesses.
+detect_install_mode() {
+    local bins confs=false node_conf=false wallet_conf=false
+    local db=false svc=false manifest=false
+    bins="$(installed_binary_count)"
+    [[ -f "$NODE_CONF" ]] && node_conf=true
+    [[ -f "$WALLET_CONF" ]] && wallet_conf=true
+    $node_conf && $wallet_conf && confs=true
+    [[ -f "$(wallet_data_dir)/mainnet/wallet.db" ]] && db=true
+    service_installed && svc=true
+    [[ -f "$MANIFEST" ]] && manifest=true
+
+    if $confs; then
+        IS_UPDATE_MODE=true
+        return
+    fi
+
+    if ! $node_conf && ! $wallet_conf && ! $svc && ! $db && ! $manifest \
+        && [[ "$bins" -eq 0 ]]; then
+        IS_UPDATE_MODE=false
+        return
+    fi
+
+    if $node_conf && ! $wallet_conf; then
+        prompt_install_or_update "A node config exists but the wallet config is missing."
+    elif $wallet_conf && ! $node_conf; then
+        prompt_install_or_update "A wallet config exists but the node config is missing."
+    elif $svc; then
+        prompt_install_or_update "Existing service units found, but no config files."
+    else
+        prompt_install_or_update "Existing monetarium binaries or wallet data found, but no config files or services."
+    fi
+}
+
+# Copy every staged binary next to its final path, smoke-test the copies and
+# only then rename them into place. Writing into a sibling temp file and
+# renaming is atomic on the same filesystem and never writes into the running
+# executable's inode, so a live process keeps using the old file until it is
+# restarted. Nothing is replaced unless every staged binary runs.
+install_staged_binaries() {
+    local bin tmp
+    local -a copy_bins=() copy_tmps=()
+
+    for bin in monetarium-node monetarium-wallet monetarium-ctl; do
+        [[ -f "$STAGING_DIR/$bin" ]] || continue
+        tmp="${INSTALL_DIR}/.${bin}.new.$$"
+        sudo mkdir -p "$INSTALL_DIR"
+        if ! sudo cp "$STAGING_DIR/$bin" "$tmp" || ! sudo chmod 0755 "$tmp"; then
+            local cleanup
+            # ${arr[@]+...} guard: macOS ships bash 3.2, where expanding an
+            # empty array under `set -u` is an unbound-variable error. Without
+            # it the first binary's failure dies with a confusing message
+            # instead of the real one.
+            for cleanup in ${copy_tmps[@]+"${copy_tmps[@]}"} "$tmp"; do
+                sudo rm -f "$cleanup"
+            done
+            die "Could not write ${bin} into ${INSTALL_DIR}. Nothing was changed."
+        fi
+        copy_bins+=("$bin")
+        copy_tmps+=("$tmp")
+        if ! "$tmp" --version >/dev/null 2>&1; then
+            local cleanup
+            for cleanup in ${copy_tmps[@]+"${copy_tmps[@]}"}; do
+                sudo rm -f "$cleanup"
+            done
+            die "Downloaded ${bin} failed its --version smoke test. Refusing to install it; nothing was changed."
+        fi
+    done
+
+    local i
+    for i in "${!copy_bins[@]}"; do
+        sudo mv -f "${copy_tmps[$i]}" "${INSTALL_DIR}/${copy_bins[$i]}"
+        info "Installed ${copy_bins[$i]} -> ${INSTALL_DIR}/${copy_bins[$i]}"
+    done
+}
+
+# Re-install only the binaries whose on-disk hash differs from the release.
+# All binaries are downloaded and verified in a staging directory first, so a
+# failure on any one of them aborts before anything installed is touched.
+run_update() {
+    local platform="$1"
+    local node_active=false wallet_active=false
+    local node_changed=false wallet_changed=false ctl_changed=false
+    local bin failed=0
+
+    service_is_active monetarium-node && node_active=true
+    service_is_active monetarium-wallet && wallet_active=true
+
+    info "Existing installation detected - updating binaries only."
+    info "Configs, wallet, service units and settings are left untouched."
+
+    STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/monetarium-update.XXXXXX")" || \
+        die "Could not create a staging directory."
+    trap 'rm -rf "${STAGING_DIR:-}"' EXIT
+
+    download_binary "$REPO_NODE"   "monetarium-node"   "$platform" "$STAGING_DIR"
+    download_binary "$REPO_WALLET" "monetarium-wallet" "$platform" "$STAGING_DIR"
+    download_binary "$REPO_CTL"    "monetarium-ctl"    "$platform" "$STAGING_DIR"
+
+    [[ -f "$STAGING_DIR/monetarium-node" ]]   && node_changed=true
+    [[ -f "$STAGING_DIR/monetarium-wallet" ]] && wallet_changed=true
+    [[ -f "$STAGING_DIR/monetarium-ctl" ]]    && ctl_changed=true
+
+    # Catch a previous interrupted update: the binary is current on disk but
+    # the service is still running the replaced inode. This must run BEFORE
+    # the "nothing to do" return, or that stale process is never noticed.
+    if ! $node_changed && $node_active \
+        && ! service_runs_current_binary monetarium-node "$INSTALL_DIR/monetarium-node"; then
+        warn "monetarium-node is running an older binary than the one on disk - restarting it."
+        node_changed=true
+    fi
+    if ! $wallet_changed && $wallet_active \
+        && ! service_runs_current_binary monetarium-wallet "$INSTALL_DIR/monetarium-wallet"; then
+        warn "monetarium-wallet is running an older binary than the one on disk - restarting it."
+        wallet_changed=true
+    fi
+
+    if ! $node_changed && ! $wallet_changed && ! $ctl_changed; then
+        green "All monetarium binaries are already current. Nothing to do."
+        return 0
+    fi
+
+    # A downloaded binary that cannot even report its version is not safe to
+    # install. The copies are validated in place before any rename happens, so
+    # a bad download leaves the installed set untouched.
+    install_staged_binaries
+
+    # Restart only services whose binary changed AND that were running before
+    # the update. A service the operator stopped stays stopped.
+    if $node_changed && $node_active; then
+        info "Restarting monetarium-node..."
+        restart_service monetarium-node || failed=1
+        if ! wait_service_active monetarium-node; then
+            red "monetarium-node did not become active after the restart. Check: $(service_log_hint monetarium-node)"
+            failed=1
+        fi
+    fi
+    if $wallet_changed && $wallet_active; then
+        info "Restarting monetarium-wallet..."
+        restart_service monetarium-wallet || failed=1
+        if ! wait_service_active monetarium-wallet; then
+            red "monetarium-wallet did not become active after the restart. Check: $(service_log_hint monetarium-wallet)"
+            failed=1
+        fi
+    fi
+
+    for bin in monetarium-node monetarium-wallet monetarium-ctl; do
+        [[ -f "$INSTALL_DIR/$bin" ]] || continue
+        info "  $("$INSTALL_DIR/$bin" --version 2>/dev/null | head -n1 || true)"
+    done
+
+    if [[ "$failed" -ne 0 ]]; then
+        red "Update failed: a service did not restart cleanly. Binaries were replaced and are NOT rolled back."
+        return 1
+    fi
+
+    green "Update complete."
+    return 0
 }
 
 # --------------------------------------------------------------------------
@@ -475,9 +904,9 @@ add_install_dir_to_path() {
     local rc_file marker="# Added by monetarium install.sh"
 
     case "$(basename "${SHELL:-}")" in
-        zsh)  rc_file="$HOME/.zshrc" ;;
-        bash) rc_file="$HOME/.bashrc" ;;
-        *)    rc_file="$HOME/.profile" ;;
+        zsh)  rc_file="$RUN_HOME/.zshrc" ;;
+        bash) rc_file="$RUN_HOME/.bashrc" ;;
+        *)    rc_file="$RUN_HOME/.profile" ;;
     esac
 
     if ! grep -qF "$marker" "$rc_file" 2>/dev/null; then
@@ -707,7 +1136,7 @@ accountgaplimit=10
 EOF
 
     chmod 600 "$NODE_CONF" "$WALLET_CONF"
-    chown "$(id -u):$(id -g)" "$NODE_CONF" "$WALLET_CONF"
+    chown "${RUN_UID}:${RUN_GID}" "$NODE_CONF" "$WALLET_CONF"
 
     # ctl config — so "monetarium-ctl getinfo" works without flags.
     mkdir -p "$CTL_DIR"
@@ -718,7 +1147,7 @@ rpcuser=${RPC_USER}
 rpcpass=${RPC_PASS}
 EOF
     chmod 600 "$CTL_CONF"
-    chown "$(id -u):$(id -g)" "$CTL_CONF"
+    chown "${RUN_UID}:${RUN_GID}" "$CTL_CONF"
 
     info "Config files written to $DATA_DIR (permissions set to 600)."
 }
@@ -727,7 +1156,7 @@ EOF
 # 5. Create wallet
 # --------------------------------------------------------------------------
 wallet_data_dir() {
-    local home="$HOME"
+    local home="$RUN_HOME"
     case "$(uname -s)" in
         Darwin) echo "${home}/Library/Application Support/Monetarium-wallet" ;;
         Linux)  echo "${home}/.monetarium-wallet" ;;
@@ -763,9 +1192,9 @@ create_wallet() {
 # 6a. systemd service (Linux)
 # --------------------------------------------------------------------------
 install_systemd_service() {
-    local node_unit="/etc/systemd/system/monetarium-node.service"
-    local wallet_unit="/etc/systemd/system/monetarium-wallet.service"
-    local svc_user="${USER:-$(id -un)}"
+    local node_unit="$SYSTEMD_UNIT_DIR/monetarium-node.service"
+    local wallet_unit="$SYSTEMD_UNIT_DIR/monetarium-wallet.service"
+    local svc_user="$RUN_USER"
 
     sudo tee "$node_unit" > /dev/null <<EOF
 [Unit]
@@ -814,7 +1243,7 @@ EOF
 # 7b. launchd plist (macOS)
 # --------------------------------------------------------------------------
 install_launchd_service() {
-    local plist_dir="$HOME/Library/LaunchAgents"
+    local plist_dir="$LAUNCHD_DIR"
     mkdir -p "$plist_dir"
 
     local node_plist="$plist_dir/com.monetarium.node.plist"
@@ -992,11 +1421,11 @@ configure_mining_and_voting() {
                 sudo systemctl restart monetarium-node
                 ;;
             Darwin)
-                if launchctl kickstart -k "gui/$(id -u)/com.monetarium.node" 2>/dev/null; then
+                if launchctl kickstart -k "gui/${RUN_UID}/com.monetarium.node" 2>/dev/null; then
                     :
                 else
-                    launchctl unload "$HOME/Library/LaunchAgents/com.monetarium.node.plist" 2>/dev/null || true
-                    launchctl load "$HOME/Library/LaunchAgents/com.monetarium.node.plist"
+                    launchctl unload "$LAUNCHD_DIR/com.monetarium.node.plist" 2>/dev/null || true
+                    launchctl load "$LAUNCHD_DIR/com.monetarium.node.plist"
                 fi
                 ;;
         esac
@@ -1143,8 +1572,8 @@ EOF
         Darwin)
             cat >> "$MANIFEST" <<EOF
 launchd plists:
-  ${HOME}/Library/LaunchAgents/com.monetarium.node.plist
-  ${HOME}/Library/LaunchAgents/com.monetarium.wallet.plist
+  ${LAUNCHD_DIR}/com.monetarium.node.plist
+  ${LAUNCHD_DIR}/com.monetarium.wallet.plist
 EOF
             ;;
     esac
@@ -1152,9 +1581,9 @@ EOF
     # Shell rc file that was modified (if any) — detect by marker
     local rc_file marker="# Added by monetarium install.sh"
     case "$(basename "${SHELL:-}")" in
-        zsh)  rc_file="$HOME/.zshrc" ;;
-        bash) rc_file="$HOME/.bashrc" ;;
-        *)    rc_file="$HOME/.profile" ;;
+        zsh)  rc_file="$RUN_HOME/.zshrc" ;;
+        bash) rc_file="$RUN_HOME/.bashrc" ;;
+        *)    rc_file="$RUN_HOME/.profile" ;;
     esac
     if grep -qF "$marker" "$rc_file" 2>/dev/null; then
         echo "shell rc (PATH addition):" >> "$MANIFEST"
@@ -1246,15 +1675,16 @@ print_warning() {
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-main() {
-    require_cmd curl
-    require_cmd tar
-    require_cmd sudo
-    require_hasher
+run_install() {
+    local platform="$1"
 
-    local platform
-    platform="$(detect_platform)"
-    info "Detected platform: $platform"
+    # A fresh install must run as the account that will own the node. Under
+    # sudo the data directory would be created by root inside the user's home
+    # (mode 700, so the service user cannot enter it) and the wallet would be
+    # created under root's HOME while the check looks in the user's.
+    if [[ "$RUN_USER" != "$(id -un)" ]]; then
+        die "Run a fresh install without sudo, as the account that will own the node."
+    fi
 
     check_selinux
 
@@ -1298,6 +1728,25 @@ main() {
     green "Installation complete."
     write_manifest
     print_warning
+}
+
+main() {
+    require_cmd curl
+    require_cmd tar
+    require_cmd sudo
+    require_hasher
+
+    local platform
+    platform="$(detect_platform)"
+    info "Detected platform: $platform"
+
+    detect_install_mode
+    if $IS_UPDATE_MODE; then
+        # A failed update exits non-zero (errexit): no rollback, loud failure.
+        run_update "$platform"
+    else
+        run_install "$platform"
+    fi
 }
 
 # When this file is `source`d (unit tests set MONETARIUM_INSTALL_FUNCTIONS_ONLY=1)
