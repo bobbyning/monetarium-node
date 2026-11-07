@@ -2665,8 +2665,6 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	// must include a consolidation address output. We extract for all votes to validate
 	// that batched SSFees correctly group voters by consolidation address.
 	voterConsolidation := make(map[int][]byte) // voterIdx → consolidation script
-	voterStakes := make(map[int]int64)         // voterIdx → stake amount
-	totalVoterStake := int64(0)
 
 	for i, vote := range votes {
 		script, err := stake.ExtractSSFeeConsolidationScript(vote.MsgTx())
@@ -2685,8 +2683,6 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			return ruleError(ErrStakeFees,
 				fmt.Sprintf("vote %d has zero or negative stake", i))
 		}
-		voterStakes[i] = voterStake
-		totalVoterStake += voterStake
 	}
 
 	// Build expected equal-per-vote distribution by consolidation address.
@@ -3074,9 +3070,9 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 		}
 	}
 
-	// Verify batched distribution matches expected stake-weighted amounts.
+	// Verify batched distribution matches the expected equal-per-vote amounts.
 	// This validates that SSFees are correctly grouped by consolidation address
-	// and that each group receives the correct proportional fee based on stake weight.
+	// and that every vote receives the same fee share regardless of ticket price.
 
 	// Verify VAR distributions
 	if len(actualDistribution) != len(expectedDistribution) {
