@@ -325,40 +325,56 @@ func (s *SKABurnState) Clear() error {
 func extractSKABurnsFromBlock(block *dcrutil.Block, blockHeight int64, params *chaincfg.Params) []SKABurnRecord {
 	var burns []SKABurnRecord
 
+	// Burns are scanned in both trees.  The regular tree carries direct
+	// SKA_BURN outputs, and the stake tree can carry them too: an MF SSFee
+	// may pay a miner's SKA fee to a burn script, and OP_RETURN outputs are
+	// exempt from the SSFee distribution accounting in validateSSFeeTxns,
+	// so such an output is valid on-chain and provably unspendable.
 	for _, tx := range block.Transactions() {
-		msgTx := tx.MsgTx()
-		txHash := tx.Hash()
+		burns = appendSKABurnsFromTx(burns, tx, blockHeight, params)
+	}
+	for _, tx := range block.STransactions() {
+		burns = appendSKABurnsFromTx(burns, tx, blockHeight, params)
+	}
 
-		// Check each output for burn scripts
-		for outIndex, txOut := range msgTx.TxOut {
-			// Only process SKA coin types (1-255)
-			if !txOut.CoinType.IsSKA() {
+	return burns
+}
+
+// appendSKABurnsFromTx appends burn records for the SKA burn-script outputs
+// of a single transaction.
+func appendSKABurnsFromTx(burns []SKABurnRecord, tx *dcrutil.Tx, blockHeight int64, params *chaincfg.Params) []SKABurnRecord {
+	msgTx := tx.MsgTx()
+	txHash := tx.Hash()
+
+	// Check each output for burn scripts
+	for outIndex, txOut := range msgTx.TxOut {
+		// Only process SKA coin types (1-255)
+		if !txOut.CoinType.IsSKA() {
+			continue
+		}
+
+		// Check if this is a burn script using the standard script detection
+		// The params.IsSKABurnScript function validates:
+		// - Exact 11-byte length
+		// - OP_RETURN opcode (0x6a)
+		// - Push length 0x09
+		// - "SKA_BURN" marker
+		// - Valid SKA coin type (1-255)
+		if params.IsSKABurnScript(txOut.PkScript) {
+			// CheckTransactionSanity guarantees non-nil SKAValue for SKA
+			// outputs before block acceptance, but guard defensively so a
+			// future change in sanity-check ordering can't turn this into
+			// a block-connect panic.
+			if txOut.SKAValue == nil {
 				continue
 			}
-
-			// Check if this is a burn script using the standard script detection
-			// The params.IsSKABurnScript function validates:
-			// - Exact 11-byte length
-			// - OP_RETURN opcode (0x6a)
-			// - Push length 0x09
-			// - "SKA_BURN" marker
-			// - Valid SKA coin type (1-255)
-			if params.IsSKABurnScript(txOut.PkScript) {
-				// CheckTransactionSanity guarantees non-nil SKAValue for SKA
-				// outputs before block acceptance, but guard defensively so a
-				// future change in sanity-check ordering can't turn this into
-				// a block-connect panic.
-				if txOut.SKAValue == nil {
-					continue
-				}
-				burns = append(burns, SKABurnRecord{
-					CoinType: txOut.CoinType,
-					Amount:   new(big.Int).Set(txOut.SKAValue),
-					Height:   blockHeight,
-					TxHash:   *txHash,
-					OutIndex: uint32(outIndex),
-				})
-			}
+			burns = append(burns, SKABurnRecord{
+				CoinType: txOut.CoinType,
+				Amount:   new(big.Int).Set(txOut.SKAValue),
+				Height:   blockHeight,
+				TxHash:   *txHash,
+				OutIndex: uint32(outIndex),
+			})
 		}
 	}
 
