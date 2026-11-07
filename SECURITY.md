@@ -2,13 +2,12 @@
 
 ## Reporting a Vulnerability
 
-The Decred project runs a bug bounty program which is approved by the stakeholders and is funded by the Decred treasury.
+Please report vulnerabilities privately through [GitHub's private vulnerability reporting](https://github.com/monetarium/monetarium-node/security/advisories/new). Do not open a public issue or pull request, or post details in public channels, until the fix has shipped.
 
-Please refer to the bounty website to understand the [scope](https://bounty.decred.org/#Scope) and how to [submit](https://bounty.decred.org/#Submit%20Vulnerability) a vulnerability.
+Send one report per issue, with the affected version and a way to reproduce it, ideally a failing test.
 
-https://bounty.decred.org/
+Monetarium does not currently run a bug bounty program.
 
 ## Supported Versions
 
-All bugs must be reproducible in the latest production release or the master branch of the code.
-
+All bugs must be reproducible in the latest production release or the main branch of the code.
