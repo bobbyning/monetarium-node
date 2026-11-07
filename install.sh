@@ -1218,6 +1218,7 @@ EOF
 Description=Monetarium wallet (auto-unlock, ticket buying / voting enabled)
 After=monetarium-node.service
 Requires=monetarium-node.service
+PartOf=monetarium-node.service
 
 [Service]
 Type=simple
