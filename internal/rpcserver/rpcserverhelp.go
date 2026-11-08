@@ -726,6 +726,7 @@ var helpDescsEnUS = map[string]string{
 	"gettxoutresult-bestblock":     "The block hash that contains the transaction output",
 	"gettxoutresult-confirmations": "The number of confirmations",
 	"gettxoutresult-value":         "The transaction amount in VAR",
+	"gettxoutresult-skavalue":      "The SKA amount as a string (atoms) to preserve precision for large values",
 	"gettxoutresult-scriptPubKey":  "The public key script used to pay coins as a JSON object",
 	"gettxoutresult-coinbase":      "Whether or not the transaction is a coinbase",
 

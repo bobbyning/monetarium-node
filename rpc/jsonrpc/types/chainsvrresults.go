@@ -477,7 +477,8 @@ type GetStakeVersionsResult struct {
 type GetTxOutResult struct {
 	BestBlock     string             `json:"bestblock"`
 	Confirmations int64              `json:"confirmations"`
-	Value         float64            `json:"value"`
+	Value         float64            `json:"value"`               // VAR only (0 for SKA)
+	SKAValue      string             `json:"skavalue,omitempty"` // SKA only (atoms as string)
 	ScriptPubKey  ScriptPubKeyResult `json:"scriptPubKey"`
 	Coinbase      bool               `json:"coinbase"`
 }

@@ -5234,6 +5234,34 @@ func TestHandleGetTxOut(t *testing.T) {
 	txOutResultChain := txOutResultMempool
 	txOutResultChain.Confirmations = 1
 
+	// An SKA output carries its value outside the int64 field: the value
+	// is reported through SKAValue (atoms as a string), matching how
+	// getrawtransaction reports SKA vouts.
+	skaAmount := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	skaAmount.Mul(skaAmount, big.NewInt(123)) // 123 SKA
+	skaMsgTx := wire.NewMsgTx()
+	skaMsgTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash:  chainhash.Hash{0x01},
+		Index: 0,
+		Tree:  wire.TxTreeRegular,
+	}, 0, nil))
+	skaMsgTx.AddTxOut(wire.NewTxOutSKA(skaAmount, cointype.CoinType(1),
+		script))
+	skaCmd := types.GetTxOutCmd{
+		Txid:           skaMsgTx.TxHash().String(),
+		Vout:           0,
+		Tree:           wire.TxTreeRegular,
+		IncludeMempool: dcrjson.Bool(true),
+	}
+	txOutResultSKA := types.GetTxOutResult{
+		BestBlock:     block432100.BlockHash().String(),
+		Confirmations: 0,
+		Value:         0,
+		SKAValue:      skaAmount.String(),
+		ScriptPubKey:  txOutResultMempool.ScriptPubKey,
+		Coinbase:      false,
+	}
+
 	// Setup a mock mempooler that has the test tx.
 	mempoolerWithTx := func() *testTxMempooler {
 		mp := defaultMockTxMempooler()
@@ -5270,6 +5298,19 @@ func TestHandleGetTxOut(t *testing.T) {
 		cmd:       &cmd,
 		mockChain: chainWithTx(),
 		result:    &txOutResultChain,
+	}, {
+		name:    "handleGetTxOut: ok SKA output from mempool",
+		handler: handleGetTxOut,
+		cmd:     &skaCmd,
+		mockTxMempooler: func() *testTxMempooler {
+			mp := defaultMockTxMempooler()
+			tx := dcrutil.NewTx(skaMsgTx)
+			tx.SetTree(wire.TxTreeRegular)
+			mp.fetchTransaction = tx
+			mp.fetchTransactionErr = nil
+			return mp
+		}(),
+		result: &txOutResultSKA,
 	}, {
 		name:    "handleGetTxOut: ok transaction not found",
 		handler: handleGetTxOut,

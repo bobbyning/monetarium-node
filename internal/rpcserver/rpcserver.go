@@ -4254,6 +4254,7 @@ func handleGetTxOut(_ context.Context, s *Server, cmd interface{}) (interface{},
 	var bestBlockHash string
 	var confirmations int64
 	var value int64
+	var skaValue *big.Int
 	var scriptVersion uint16
 	var pkScript []byte
 	var isCoinbase bool
@@ -4302,6 +4303,9 @@ func handleGetTxOut(_ context.Context, s *Server, cmd interface{}) (interface{},
 		bestBlockHash = best.Hash.String()
 		confirmations = 0
 		value = txOut.Value
+		if txOut.CoinType.IsSKA() && txOut.SKAValue != nil {
+			skaValue = new(big.Int).Set(txOut.SKAValue)
+		}
 		scriptVersion = txOut.Version
 		pkScript = txOut.PkScript
 		isCoinbase = standalone.IsCoinBaseTx(mtx, isTreasuryEnabled)
@@ -4325,6 +4329,11 @@ func handleGetTxOut(_ context.Context, s *Server, cmd interface{}) (interface{},
 		bestBlockHash = best.Hash.String()
 		confirmations = 1 + best.Height - entry.BlockHeight()
 		value = entry.Amount()
+		// SKA outputs store 0 in the int64 amount; the real value is
+		// only in the SKA amount (nil for VAR outputs).
+		if utxo := entry.ToUtxoEntry(); utxo != nil {
+			skaValue = utxo.SKAAmount()
+		}
 		scriptVersion = entry.ScriptVersion()
 		pkScript = entry.PkScript()
 		isCoinbase = entry.IsCoinBase()
@@ -4347,10 +4356,19 @@ func handleGetTxOut(_ context.Context, s *Server, cmd interface{}) (interface{},
 	// Determine the number of required signatures for known standard types.
 	reqSigs := stdscript.DetermineRequiredSigs(scriptVersion, script)
 
+	// SKA outputs carry their value outside the int64 amount field, so
+	// report it like Vout.SKAValue does: atoms as a string, omitted for
+	// VAR outputs.
+	skaValueStr := ""
+	if skaValue != nil {
+		skaValueStr = skaValue.String()
+	}
+
 	txOutReply := &types.GetTxOutResult{
 		BestBlock:     bestBlockHash,
 		Confirmations: confirmations,
 		Value:         dcrutil.Amount(value).ToUnit(dcrutil.AmountCoin),
+		SKAValue:      skaValueStr,
 		ScriptPubKey: types.ScriptPubKeyResult{
 			Asm:       disbuf,
 			Hex:       hex.EncodeToString(pkScript),
