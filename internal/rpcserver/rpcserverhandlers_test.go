@@ -8455,3 +8455,53 @@ func testRPCServerHandler(t *testing.T, tests []rpcTest) {
 		})
 	}
 }
+
+func TestFeeInfoForMempoolSkipsSKATxs(t *testing.T) {
+	t.Parallel()
+
+	// One VAR and one SKA regular transaction in the pool. The SKA
+	// transaction pays its fee in SKA atoms (SKAFee); its int64 Fee is
+	// zero, and it must not dilute the VAR fee statistics.
+	varTx := dcrutil.NewTx(func() *wire.MsgTx {
+		tx := wire.NewMsgTx()
+		tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+			Hash: chainhash.Hash{0x01},
+			Tree: wire.TxTreeRegular,
+		}, 3e8, nil))
+		tx.AddTxOut(wire.NewTxOut(2e8, nil))
+		return tx
+	}())
+	skaTx := dcrutil.NewTx(func() *wire.MsgTx {
+		tx := wire.NewMsgTx()
+		tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+			Hash: chainhash.Hash{0x02},
+			Tree: wire.TxTreeRegular,
+		}, 0, nil))
+		tx.AddTxOut(wire.NewTxOutSKA(new(big.Int).Exp(big.NewInt(10),
+			big.NewInt(18), nil), cointype.CoinType(1), nil))
+		return tx
+	}())
+	skaDesc := &mempool.TxDesc{}
+	skaDesc.Tx = skaTx
+	skaDesc.Type = stake.TxTypeRegular
+	skaDesc.Fee = 0
+	skaDesc.SKAFee = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	varDesc := &mempool.TxDesc{}
+	varDesc.Tx = varTx
+	varDesc.Type = stake.TxTypeRegular
+	varDesc.Fee = 1e8
+	cfg := *defaultMockConfig(defaultChainParams)
+	cfg.TxMempooler = &testTxMempooler{txDescs: []*mempool.TxDesc{
+		varDesc, skaDesc,
+	}}
+	s := &Server{cfg: cfg}
+
+	info := feeInfoForMempool(s, stake.TxTypeRegular)
+	if info.Number != 1 {
+		t.Fatalf("fee info counted %d transactions, want 1 (the SKA tx excluded)",
+			info.Number)
+	}
+	if info.Mean == 0 {
+		t.Fatal("VAR fee statistics diluted to zero by the SKA transaction")
+	}
+}

@@ -5276,7 +5276,10 @@ func feeInfoForMempool(s *Server, txType stake.TxType) *types.FeeInfoMempool {
 	txDs := s.cfg.TxMempooler.TxDescs()
 	ticketFees := make([]dcrutil.Amount, 0, len(txDs))
 	for _, txD := range txDs {
-		if txD.Type == txType {
+		// SKA transactions pay their fee in SKA atoms (TxDesc.SKAFee);
+		// the int64 Fee field reads as zero for them, which would
+		// dilute the VAR fee statistics with zero-fee entries.
+		if txD.Type == txType && txD.SKAFee == nil {
 			feePerKb := (dcrutil.Amount(txD.Fee)) * 1000 /
 				dcrutil.Amount(txD.Tx.MsgTx().SerializeSize())
 			ticketFees = append(ticketFees, feePerKb)
@@ -5308,6 +5311,18 @@ func calcFeePerKb(tx *dcrutil.Tx) dcrutil.Amount {
 	return ((in - out) * 1000) / dcrutil.Amount(tx.MsgTx().SerializeSize())
 }
 
+// isSKATx returns whether the transaction pays an SKA coin type. Regular-tree
+// transactions carry a single coin type, so one SKA output marks the whole
+// transaction.
+func isSKATx(tx *wire.MsgTx) bool {
+	for _, txOut := range tx.TxOut {
+		if txOut.CoinType.IsSKA() {
+			return true
+		}
+	}
+	return false
+}
+
 // ticketFeeInfoForBlock fetches the ticket fee information for a given tx type
 // in a block.
 func ticketFeeInfoForBlock(s *Server, height int64, txType stake.TxType) (*types.FeeInfoBlock, error) {
@@ -5336,6 +5351,13 @@ func ticketFeeInfoForBlock(s *Server, height int64, txType stake.TxType) (*types
 			if i == 0 {
 				continue
 			}
+			// SKA transactions carry their fee outside the int64
+			// value fields, so calcFeePerKb reads them as zero: they
+			// would dilute the VAR fee statistics with zero-fee
+			// entries.
+			if isSKATx(tx.MsgTx()) {
+				continue
+			}
 
 			txFees[itr] = calcFeePerKb(tx)
 			itr++
@@ -5349,6 +5371,7 @@ func ticketFeeInfoForBlock(s *Server, height int64, txType stake.TxType) (*types
 			}
 		}
 	}
+	txFees = txFees[:itr]
 
 	return &types.FeeInfoBlock{
 		Height: uint32(height),
@@ -5381,6 +5404,12 @@ func ticketFeeInfoForRange(s *Server, start int64, end int64, txType stake.TxTyp
 			for i, tx := range bl.Transactions() {
 				// Skip the coin base.
 				if i == 0 {
+					continue
+				}
+				// SKA fees are invisible to calcFeePerKb (see
+				// ticketFeeInfoForBlock); keep them out of the VAR
+				// fee statistics.
+				if isSKATx(tx.MsgTx()) {
 					continue
 				}
 
