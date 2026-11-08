@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"io"
 	"strconv"
 	"sync"
@@ -1078,12 +1079,29 @@ func (m *wsNotificationManager) notifyForNewTx(clients map[chan struct{}]*wsClie
 	mtx := tx.MsgTx()
 
 	var amount int64
+	var skaValue *big.Int
 	for _, txOut := range mtx.TxOut {
+		// SKA outputs carry their value outside the int64 field; sum
+		// it separately so the notification does not announce an SKA
+		// transaction as a zero-value transfer.
+		if txOut.CoinType.IsSKA() {
+			if txOut.SKAValue != nil {
+				if skaValue == nil {
+					skaValue = new(big.Int)
+				}
+				skaValue.Add(skaValue, txOut.SKAValue)
+			}
+			continue
+		}
 		amount += txOut.Value
+	}
+	skaValueStr := ""
+	if skaValue != nil {
+		skaValueStr = skaValue.String()
 	}
 
 	ntfn := types.NewTxAcceptedNtfn(txHashStr,
-		dcrutil.Amount(amount).ToCoin())
+		dcrutil.Amount(amount).ToCoin(), skaValueStr)
 	marshalledJSON, err := dcrjson.MarshalCmd("1.0", nil, ntfn)
 	if err != nil {
 		log.Errorf("Failed to marshal tx notification: %s",

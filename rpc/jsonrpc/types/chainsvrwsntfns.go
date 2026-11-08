@@ -155,16 +155,18 @@ func NewReorganizationNtfn(oldHash string, oldHeight int32, newHash string,
 
 // TxAcceptedNtfn defines the txaccepted JSON-RPC notification.
 type TxAcceptedNtfn struct {
-	TxID   string  `json:"txid"`
-	Amount float64 `json:"amount"`
+	TxID     string  `json:"txid"`
+	Amount   float64 `json:"amount"`              // VAR only (0 for SKA)
+	SKAValue string  `json:"skavalue,omitempty"` // SKA only (atoms as string)
 }
 
 // NewTxAcceptedNtfn returns a new instance which can be used to issue a
 // txaccepted JSON-RPC notification.
-func NewTxAcceptedNtfn(txHash string, amount float64) *TxAcceptedNtfn {
+func NewTxAcceptedNtfn(txHash string, amount float64, skaValue string) *TxAcceptedNtfn {
 	return &TxAcceptedNtfn{
-		TxID:   txHash,
-		Amount: amount,
+		TxID:     txHash,
+		Amount:   amount,
+		SKAValue: skaValue,
 	}
 }
 
