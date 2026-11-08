@@ -88,15 +88,31 @@ func TestChainSvrWsNtfns(t *testing.T) {
 		{
 			name: "txaccepted",
 			newNtfn: func() (interface{}, error) {
-				return dcrjson.NewCmd(Method("txaccepted"), "123", 1.5)
+				return dcrjson.NewCmd(Method("txaccepted"), "123", 1.5, "")
 			},
 			staticNtfn: func() interface{} {
-				return NewTxAcceptedNtfn("123", 1.5)
+				return NewTxAcceptedNtfn("123", 1.5, "")
 			},
-			marshalled: `{"jsonrpc":"1.0","method":"txaccepted","params":["123",1.5],"id":null}`,
+			marshalled: `{"jsonrpc":"1.0","method":"txaccepted","params":["123",1.5,""],"id":null}`,
 			unmarshalled: &TxAcceptedNtfn{
-				TxID:   "123",
-				Amount: 1.5,
+				TxID:     "123",
+				Amount:   1.5,
+				SKAValue: "",
+			},
+		},
+		{
+			name: "txaccepted (SKA)",
+			newNtfn: func() (interface{}, error) {
+				return dcrjson.NewCmd(Method("txaccepted"), "124", 0.0, "123000000000000000000")
+			},
+			staticNtfn: func() interface{} {
+				return NewTxAcceptedNtfn("124", 0.0, "123000000000000000000")
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"txaccepted","params":["124",0,"123000000000000000000"],"id":null}`,
+			unmarshalled: &TxAcceptedNtfn{
+				TxID:     "124",
+				Amount:   0.0,
+				SKAValue: "123000000000000000000",
 			},
 		},
 		{
